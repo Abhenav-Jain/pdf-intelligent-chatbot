@@ -1,0 +1,8 @@
+streamlit
+python-dotenv
+pymupdf
+langchain
+langchain-mistralai
+langchain-community
+faiss-cpu
+rank-bm25

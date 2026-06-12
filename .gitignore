@@ -1,0 +1,15 @@
+# Environment - API key safe rakhne ke liye
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
+# FAISS index (auto generate hota hai)
+*.faiss
+*.pkl
+
+# VS Code
+.vscode/
