@@ -562,7 +562,12 @@ pdf_store = {
 
 
 # ── #3: Query Rewriting ───────────────────────────────────────────────────────
-def rewrite_query(question: str, document_type: str = "technical", temperature: float = 0.1) -> str:
+def rewrite_query(
+    question: str,
+    document_type: str = "technical",
+    temperature: float = 0.1,
+    recent_context: str = None,
+) -> str:
     """
     #3: Rewrites vague/short user questions into more specific,
     search-friendly queries before retrieval.
@@ -577,8 +582,33 @@ def rewrite_query(question: str, document_type: str = "technical", temperature: 
 
     [PERF] Round 7: reuses a cached LLM client (see _get_llm) rather than
     constructing a new one on every call.
+
+    [FIX] Round 7.13: new recent_context parameter — a short string (the
+    last user/assistant exchange) that lets the rewriter resolve pronouns
+    and elliptical follow-ups BEFORE retrieval happens. Concrete bug this
+    fixes: a two-turn conversation — "What is the oil capacity?" (answered
+    correctly) followed by "And what's the minimum for that?" — failed,
+    because this function never saw any conversation history at all. The
+    FINAL answer-generation step does receive chat history (via the
+    {chat_history} prompt placeholder), but that's too late: if the
+    *retrieval* query is just the literal text "what's the minimum for
+    that?" with no idea what "that" refers to, the wrong (or no) content
+    gets fetched, and no amount of history available to the generator
+    afterward can recover content that was never retrieved in the first
+    place. Pronoun/ellipsis resolution has to happen before retrieval, not
+    just before generation.
     """
     llm = _get_llm(MODEL, temperature, max_tokens=600)
+
+    history_block = ""
+    if recent_context:
+        history_block = f"""
+Recent conversation (use ONLY to resolve pronouns/references like "that",
+"it", "this", or an implied subject in a short follow-up question — do not
+just repeat this verbatim, and ignore it if the current question is already
+self-contained):
+{recent_context}
+"""
 
     rewrite_prompt = f"""
 You are an expert RAG query re-writer for technical operator manuals and equipment documents.
@@ -587,6 +617,12 @@ Your job is to understand the user's real intent and convert it into the most ef
 
 Rules:
 - Capture the core topic accurately
+- If the current question is a short follow-up that depends on the recent
+  conversation to make sense (e.g. "what's the minimum for that?" right
+  after a question about oil capacity), resolve the reference using the
+  recent conversation below and rewrite it as a fully self-contained query
+  — e.g. "minimum for that" after an oil-capacity question becomes
+  "minimum oil capacity lower level indicator fill line", not just "minimum".
 - If the question already closely matches an actual section title or specific
   procedure name in this kind of document (e.g. "basic operations" closely
   matching a section literally titled "Basic Operation"), preserve that exact
@@ -595,6 +631,16 @@ Rules:
   in MANY unrelated sections of a technical manual (e.g. "Filter Control",
   "Special Programming"), so padding a specific query with them can drift
   retrieval toward the wrong section entirely.
+- Watch for a specific ambiguity: phrases like "restart", "turn back on",
+  "re-energize", or "power back up" can describe either (a) the NORMAL
+  start-up procedure (turning the unit on for ordinary use), or (b) ERROR
+  RECOVERY (power-cycling the control board after a fault, which an Error
+  Codes section repeats for almost every entry — e.g. "turn switch to OFF
+  position, then back to ON"). If the question does NOT mention an error
+  code, a symptom, or something going wrong, assume it means the NORMAL
+  start-up procedure and bias the rewrite toward THAT section's specific
+  vocabulary instead of generic power-cycling language, since the generic
+  phrasing alone tends to retrieve Error Codes content instead.
 - Add technical keywords and synonyms that are SPECIFIC and DISTINCTIVE to
   the topic asked about, not generic ones that could match many sections.
 - Make it concise but information-rich
@@ -608,7 +654,10 @@ Examples:
 - "what is the capacity" -> "pot capacity specifications"
 - "give me the basic operations" -> "basic operation startup procedure POWER switch frypot oil DROP button load product press start cook cycle"
 - "give me all basic operations in detail" -> "basic operation startup procedure POWER switch frypot oil DROP button load product press start cook cycle end of cycle"
-
+- "how do I re-energize the system after a power failure?" -> "start-up procedure AUTO-MELT auto-melt mode set point bar graph Mlt Mix Top Pol main cook menu POWER switch ON position"
+- "what do I do if the display shows an error after restarting?" -> "error codes troubleshooting display message correction control board"
+- (after a question about oil capacity) "and what's the minimum for that?" -> "minimum oil capacity lower level indicator fill line frypot"
+{history_block}
 User Question: {question}
 Rewritten Query (return ONLY the query):"""
 
@@ -1001,9 +1050,24 @@ def _wants_full_section_expansion(question: str) -> bool:
     unconditionally backfills an entire contiguous page range. That's the
     right call for "give me the error codes table" (a genuine multi-page
     table), but it is too blunt an instrument to fire on generic phrasing.
+
+    [FIX] Round 7.10: the error-code special case used to be a bare "e-"
+    substring check, which matched ANY word containing that two-character
+    sequence — including "re-energize", "re-engage", "re-establish", etc.
+    Confirmed bug: "How do I re-energize the system after a power failure?"
+    triggered this path, silently switching to COMPREHENSIVE_TOP_K_CHUNKS
+    and bypassing the anchor-locality safety net (see retrieve_with_sources
+    — anchor-locality only applies when expand_sections=False), with
+    nothing in place to stop scope creep if the wide net happened to
+    cluster badly. It didn't visibly misfire in that specific test run,
+    but the bug was real and the safety net was genuinely disabled by
+    accident — not something to leave in place because it got lucky once.
+    Now requires the "e" to actually be followed by a digit (with an
+    optional hyphen in between), matching real error-code mentions like
+    "E-4", "e4", "E-10A" but not ordinary English words.
     """
     q_lower = question.lower().strip()
-    if any(term in q_lower for term in ["error code", "error codes", "e-"]):
+    if "error code" in q_lower or re.search(r"\be-?\d", q_lower):
         return True
     q = f" {q_lower} "
     return any(kw in q for kw in _TABLE_KEYWORDS + _COMPARE_KEYWORDS)
@@ -1404,6 +1468,87 @@ def _render_final_answer(parsed: dict) -> str:
     return response
 
 
+# ── [FIX] Round 7.11: post-generation retry when retrieval found the wrong topic ──
+_NOT_FOUND_PHRASES = [
+    "does not contain", "not covered in the document", "not covered in this document",
+    "not available in the document", "context does not contain",
+    "context provided does not contain", "is not covered", "no information about",
+    "not mentioned in the document", "not contain information about",
+]
+
+
+def _looks_like_not_found(parsed: dict) -> bool:
+    """
+    [FIX] Round 7.11: True when an answer reads like the model couldn't
+    actually locate the requested content in the retrieved context.
+
+    Concrete bug this targets: "Clean-Out Mode" content exists in the
+    document, but a retrieval pass anchored on the wrong nearby section
+    (Drain Pan Assembly / Display Options, which share some "drain"
+    vocabulary) and the model reported "the provided context does not
+    contain information about the Clean-Out Mode process" — a retrieval
+    miss, not a hallucination, but one the existing recall fallback
+    couldn't catch because it only measures whether retrieval came back
+    *thin* (few chars/pages), not whether it came back about the *wrong
+    topic*. A non-thin-but-wrong-topic result and a genuinely thorough
+    "not found" both look identical from a pure character-count
+    perspective — this checks the model's own verdict instead.
+
+    [FIX] Round 7.12: dropped the requirement that a Tag be present. A
+    question that's genuinely relevant to the document (Clean-Out Mode IS
+    a real section here) but retrieved the wrong section's content can get
+    misclassified as a NON-RELEVANT QUERY — which has no Tag by schema —
+    rather than a Relevant Query with missing info, since from the model's
+    point of view the retrieved excerpts (about Drain Pan Assembly) didn't
+    seem to relate to "Clean-Out Mode" at all. Gating on Tag let that exact
+    case slip through with no retry. The phrase match alone is the real
+    signal; a genuinely off-topic question (e.g. "what's the weather")
+    triggering one extra, ultimately-discarded retry call is an acceptable,
+    bounded cost — the retry will just come back "not found" again and the
+    original honest answer is kept (see ask_question/ask_question_stream).
+    """
+    response_lower = parsed.get("response", "").lower()
+    return any(phrase in response_lower for phrase in _NOT_FOUND_PHRASES)
+
+
+def _prepare_escalated_retry_inputs(
+    retriever, user_question: str, document_type: str
+) -> tuple:
+    """
+    [FIX] Round 7.11: builds chain inputs for a single retry pass after the
+    first attempt's answer looked like a retrieval miss (see
+    _looks_like_not_found). Deliberately forces the widest, least-clever
+    settings — bypassing whatever rewriting/tiering choice led the first
+    attempt to anchor on the wrong section:
+      - the user's RAW question, with no rewriting and no format-keyword
+        stripping, in case either step drifted away from the document's
+        own terminology;
+      - COMPREHENSIVE_TOP_K_CHUNKS + full section expansion, so a genuine
+        multi-page section gets every chunk in its range rather than
+        whatever a narrower pass happened to rank highest;
+      - conversation history dropped, to maximize the token budget
+        available for content on this one bounded retry.
+    This only ever runs once per question (no further escalation beyond
+    this), so the worst-case cost is one extra retrieval + generation call,
+    paid only when the first pass actually needed it.
+    """
+    pdf_content, source_pages = retrieve_with_sources(
+        retriever, user_question, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=True
+    )
+    chunk_budget = CHUNK_TOKEN_BUDGET_COMPREHENSIVE
+    chunk_tokens = estimate_token_count(pdf_content)
+    if chunk_tokens > chunk_budget:
+        pdf_content = pdf_content[: chunk_budget * 4]
+
+    chain_inputs = {
+        "pdf_content": pdf_content,
+        "user_question": user_question,
+        "chat_history": "",
+        "format_instruction": detect_response_format(user_question),
+    }
+    return chain_inputs, source_pages
+
+
 # ── STEP 6: Build chain ───────────────────────────────────────────────────────
 def build_chain():
     """
@@ -1470,6 +1615,19 @@ def _prepare_pipeline_inputs(
     # _strip_format_keywords docstring for the concrete bug this avoids.
     retrieval_question = _strip_format_keywords(user_question)
 
+    # [FIX] Round 7.13: a short, lightweight slice of the LAST exchange only
+    # (not the full MEMORY_LAST_K history used for the final answer) — just
+    # enough for rewrite_query() to resolve a pronoun/ellipsis in a terse
+    # follow-up like "what's the minimum for that?" before retrieval runs.
+    recent_context = None
+    if chat_history:
+        last_pair = chat_history[-2:]
+        if last_pair:
+            recent_context = "\n".join(
+                f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+                for m in last_pair
+            )
+
     # [FIX] Round 7.2: tiered intent detection — see _wants_full_section_expansion
     # / _wants_broader_recall docstrings. Computed once, reused for the rewrite
     # temperature and the retrieval-width decisions below.
@@ -1478,7 +1636,10 @@ def _prepare_pipeline_inputs(
     rewrite_temperature = 0.0 if broader_recall else 0.1
 
     search_query = rewrite_query(
-        retrieval_question, document_type=document_type, temperature=rewrite_temperature
+        retrieval_question,
+        document_type=document_type,
+        temperature=rewrite_temperature,
+        recent_context=recent_context,
     )
     logger.debug(
         "Question=%r Rewritten=%r FullExpansion=%s BroaderRecall=%s",
@@ -1574,6 +1735,12 @@ def ask_question(
     _prepare_pipeline_inputs(), invokes the chain once, parses the
     structured JSON the model returned, and returns the rendered answer.
 
+    [FIX] Round 7.11: if the first pass's answer looks like a retrieval
+    miss (see _looks_like_not_found), automatically retries once with
+    escalated, rewriting-bypassing retrieval settings (see
+    _prepare_escalated_retry_inputs) before giving up — see that
+    function's docstring for the concrete bug this fixes.
+
     Returns:
         (answer_string, [source_page_numbers])
     """
@@ -1586,6 +1753,16 @@ def ask_question(
 
     raw_output = chain.invoke(chain_inputs)
     parsed = _parse_json_answer(raw_output)
+
+    if _looks_like_not_found(parsed):
+        retry_inputs, retry_pages = _prepare_escalated_retry_inputs(
+            retriever, user_question, document_type
+        )
+        retry_raw = chain.invoke(retry_inputs)
+        retry_parsed = _parse_json_answer(retry_raw)
+        if not _looks_like_not_found(retry_parsed):
+            parsed, source_pages = retry_parsed, retry_pages
+
     answer = _render_final_answer(parsed)
     return answer, source_pages
 
@@ -1599,14 +1776,17 @@ def ask_question_stream(
     document_type: str = "technical",
 ) -> tuple:
     """
-    [STREAM] Streaming counterpart to ask_question(). Runs the same
-    retrieval + context-budget + format-detection pipeline up front (fast —
-    no LLM generation yet), then returns immediately with:
+    [STREAM] Streaming counterpart to ask_question(). Runs retrieval,
+    generation, and (if needed) the Round 7.11 retry-on-not-found pass
+    before returning:
 
         (source_pages, answer_chunk_generator)
 
-    `source_pages` is already known at this point (retrieval has finished),
-    so the UI can display "Sources: Page X" right away.
+    `source_pages` reflects whichever pass's answer is actually being
+    shown — if a retry occurred, it's the retry's pages, not the first
+    pass's. The returned generator is a pure "reveal" animation over
+    already-finalized text; no further LLM calls happen once this function
+    returns.
 
     [FIX] Round 7 — streaming design note: the generator below buffers the
     full raw JSON response from chain.stream() internally before yielding
@@ -1639,15 +1819,32 @@ def ask_question_stream(
         retriever, user_question, chat_history, document_type
     )
 
+    raw_output = "".join(chain.stream(chain_inputs))
+    parsed = _parse_json_answer(raw_output)
+
+    # [FIX] Round 7.11: retry-on-not-found (see _looks_like_not_found /
+    # _prepare_escalated_retry_inputs) runs HERE — synchronously, before
+    # returning — rather than lazily inside the generator. This is what
+    # makes it safe: source_pages below is decided only once, after we
+    # already know which pass's answer will actually be shown, instead of
+    # being locked in to the first pass's pages before a later retry could
+    # change them. The user-visible latency characteristic is unchanged
+    # from before this fix — the generator already buffered the entire
+    # first pass before revealing anything, so doing the retry check at
+    # this point (rather than after returning) costs nothing extra except
+    # the bounded, rare cost of the retry call itself.
+    if _looks_like_not_found(parsed):
+        retry_inputs, retry_pages = _prepare_escalated_retry_inputs(
+            retriever, user_question, document_type
+        )
+        retry_raw = "".join(chain.stream(retry_inputs))
+        retry_parsed = _parse_json_answer(retry_raw)
+        if not _looks_like_not_found(retry_parsed):
+            parsed, source_pages = retry_parsed, retry_pages
+
+    final_text = _render_final_answer(parsed)
+
     def _answer_generator():
-        raw_chunks = []
-        for piece in chain.stream(chain_inputs):
-            raw_chunks.append(piece)
-        raw_output = "".join(raw_chunks)
-
-        parsed = _parse_json_answer(raw_output)
-        final_text = _render_final_answer(parsed)
-
         # Reveal the already-final, validated text in small increments —
         # purely a pacing/animation choice, not a guess about content that
         # could later change (see design note above).
