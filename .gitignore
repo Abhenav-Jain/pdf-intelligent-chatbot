@@ -1,15 +1,39 @@
-# Environment - API key safe rakhne ke liye
+# Environment variables — NEVER commit API keys!
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
-*.pyc
-venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
 *.egg-info/
 
-# FAISS index (auto generate hota hai)
-*.faiss
-*.pkl
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
 
-# VS Code
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE / editor
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Uploaded test PDFs (remove this line if you WANT to commit a sample PDF)
+*.pdf

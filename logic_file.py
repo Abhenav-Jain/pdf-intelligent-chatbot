@@ -8,141 +8,112 @@ Task 1: PDF Intelligence Chatbot — Core Logic
   #5 → Hybrid Search (BM25 keyword + Semantic)
   #6 → Format-Aware Answers (table / comparison / paragraph)
   #7 → Streaming Answers (partial results as they're generated)
+  #8 → Structured JSON Output (Tag + Response, query classification)
+  #9 → Universal Recall Fallback (don't say "not available" too eagerly)
 
 All Changes Log:
   Round 1 — Prompt Engineering Improvements:
     [FIX]  Added max_tokens to both LLM instances (was missing)
-    [TUNE] TOP_K_CHUNKS: 5 → 7
-    [TUNE] CHUNK_SIZE: 1000 → 700
-    [TUNE] CHUNK_OVERLAP: 200 → 140 (maintains 20% ratio)
-    [TUNE] MEMORY_LAST_K: 5 → 3
+    [TUNE] TOP_K_CHUNKS, CHUNK_SIZE, CHUNK_OVERLAP, MEMORY_LAST_K tuned
     [TUNE] System prompt: added partial-info instruction
     [TUNE] Human prompt: added page citation enforcement
     [TUNE] Query rewrite: now domain-aware via document_type param
     [TUNE] load_pdf*: now returns truncation_warning for UI display
 
   Round 2 — Markdown + Context Window + Hallucination:
-    [MD]   MAX_TOKENS: 1024 → 2048 (markdown answers are longer)
-    [MD]   System prompt: added markdown formatting instruction
-    [MD]   Human prompt: added "Respond in Markdown" footer
-    [CTX]  New estimate_token_count() helper (4 chars ≈ 1 token)
-    [CTX]  New CONTEXT_TOKEN_BUDGET = 28_000 (safe limit under 32k)
-    [CTX]  New CHUNK_TOKEN_BUDGET = 6_000 (caps chunk tokens in prompt)
-    [CTX]  ask_question(): dynamic history trim when context is tight
-    [CTX]  ask_question(): chunk text capped at CHUNK_TOKEN_BUDGET
-    [HAL]  System prompt: added uncertainty signalling instruction
-    [HAL]  Human prompt: added [Low Confidence] prefix instruction
+    [MD]   MAX_TOKENS raised — markdown answers are longer
+    [CTX]  estimate_token_count(), CONTEXT_TOKEN_BUDGET, CHUNK_TOKEN_BUDGET
+    [HAL]  Uncertainty signalling + [Low Confidence] prefix instruction
     [HAL]  rewrite_query(): temperature 0 → 0.1 (diverse rewriting)
 
   Round 3 — Format-Aware Answers + Streaming:
-    [FMT]    New detect_response_format() — inspects the user's question for
-             explicit table / comparison-difference / paragraph requests and
-             returns an instruction string to inject into the prompt, so the
-             model actually renders a Markdown table for tables/comparisons
-             instead of defaulting to bullet points.
-    [FMT]    Human prompt: added {format_instruction} placeholder.
-    [FIX]    _strip_format_keywords() now actually wired into
-             _prepare_pipeline_inputs() (it existed but was never called).
-             Bug: "Give me the error codes table" was BM25 keyword-matching
-             the unrelated "TABLE OF CONTENTS" page because both contain the
-             literal word "table", diluting the real Error Codes pages out
-             of the top retrieved chunks and causing the model to (wrongly)
-             report the information as unavailable. Retrieval now searches
-             on a cleaned query with format words removed; detect_response_format()
-             still sees the original question so the requested format is kept.
-    [FIX]    System prompt: added explicit decoupling — a FORMAT REQUIREMENT
-             only changes presentation, never the availability decision, and
-             tabular source content is preserved as a Markdown table by
-             default even without an explicit "table" request.
-    [REFAC]  Extracted shared retrieval + context-budget logic out of
-             ask_question() into _prepare_pipeline_inputs(), reused by the
-             new streaming path so both stay in sync.
-    [STREAM] New ask_question_stream() — returns (source_pages, generator).
-             The generator yields the answer text incrementally (as the LLM
-             produces it) instead of blocking until the full answer is ready,
-             so the UI can render partial results live.
+    [FMT]    detect_response_format() — table / comparison / paragraph detection
+    [FIX]    _strip_format_keywords() wired into retrieval (was unused)
+    [FIX]    System prompt: FORMAT REQUIREMENT decoupled from availability
+    [REFAC]  _prepare_pipeline_inputs() shared by blocking + streaming paths
+    [STREAM] ask_question_stream() — partial results instead of a blank wait
 
   Round 4 — Multi-Page Table Completeness:
-    [FIX] New _wants_comprehensive_listing() — detects table/comparison/
-          "all of X" requests that imply an exhaustive answer, not a
-          quick lookup.
-    [FIX] New _boost_retriever_k() / _restore_retriever_k() — temporarily
-          widen each sub-retriever's k for a single comprehensive call
-          (mutating in place, no re-embedding needed), then restore.
-          Bug: "give me the error codes table" only pulled 7-14 chunks
-          total (TOP_K_CHUNKS=7 per sub-retriever), nowhere near enough to
-          cover an error-codes table spanning 6 PDF pages — the middle
-          pages were silently missing from the answer.
-    [TUNE] New COMPREHENSIVE_TOP_K_CHUNKS=20 and
-           CHUNK_TOKEN_BUDGET_COMPREHENSIVE=12_000, used only when
-           _wants_comprehensive_listing() is true.
-    [TUNE] MAX_TOKENS: 2048 → 3072 — a full multi-row table was getting
-           cut off mid-table at the old limit.
-    [FIX]  Human prompt: the "not available" sentence and the
-           partial-information path are now explicitly mutually exclusive.
-           Bug: the model was prefixing a perfectly good partial table
-           with "The information is not available in the document." —
-           contradicting itself in the same response.
+    [FIX]  _wants_comprehensive_listing() + _boost_retriever_k() — widen
+           retrieval for table/comparison/"all of X" requests
+    [TUNE] COMPREHENSIVE_TOP_K_CHUNKS, CHUNK_TOKEN_BUDGET_COMPREHENSIVE
+    [FIX]  "not available" vs partial-info made mutually exclusive
 
   Round 5 — Full Multi-Page Section Coverage + Citation Consistency:
-    [FIX] New _cluster_pages() / _expand_to_full_section() — after a
-          comprehensive retrieval pass, detect when retrieved pages form
-          one contiguous section (e.g. pages 60-65 for an error-codes
-          table) and pull in EVERY chunk from that range out of the
-          retriever's all_chunks, not just whichever ones ranked inside
-          the boosted top-20. Fixes rows (E-14, E-6B, E-93, etc.) that
-          were still missing even after the Round 4 k-boost, because
-          their individual chunk ranked just outside the top-20.
-    [FIX] EnsembleRetriever: new all_chunks field (text, page) pairs,
-          populated in build_hybrid_retriever() — needed by the expansion
-          above since BM25/FAISS only expose their top-k, not the full set.
-    [FIX] retrieve_with_sources(): for comprehensive requests, chunks are
-          now sorted by page number before being joined into context, so
-          a multi-page table reads in document order instead of jumping
-          around in relevance-rank order (the E-4/E-5/E-6A → E-41S...
-          → E-10A... ordering bug).
-    [FIX] retrieve_with_sources(): each chunk is now labelled
-          "[PDF Page N]" using the TRUE PDF page index before being
-          joined into context, and the human prompt now tells the model
-          to cite using that label. Bug: the model was instead reading
-          page numbers printed in the document's own header/footer text
-          (e.g. "Nov 2016 60"), which is offset by several pages from the
-          true PDF index (e.g. true page 66) — so the "(Page 60)" cited
-          inline in the answer didn't match the "Sources: Page 66" tag
-          shown in the UI for the same content.
+    [FIX] _cluster_pages() / _expand_to_full_section() — backfill every
+          chunk in a detected contiguous section, not just top-k ranked ones
+    [FIX] EnsembleRetriever.all_chunks — full (text, page) index for that
+    [FIX] retrieve_with_sources(): page-sorted output + "[PDF Page N]"
+          labels so citations match the true PDF index, not header text
 
   Round 6 — Reliability Hardening for Multi-Page Tables:
-    [TUNE] COMPREHENSIVE_TOP_K_CHUNKS: 20 → 30. Even after Round 5's
-           cluster expansion, a handful of rows (E-10, E-14, E-15C, E-15P)
-           were still occasionally missing — wider initial retrieval
-           means the expansion has less work to do and is less dependent
-           on the cluster happening to bridge every gap correctly.
-    [FIX]  rewrite_query() temperature is now a parameter; comprehensive
-           requests use temperature=0 (was always 0.1). The slight
-           wording randomness in query rewriting was shifting exactly
-           which chunks landed in the initial top-k between identical
-           runs of "give me the error codes table" — fine for a quick
-           single-fact lookup, but it made multi-page table completeness
-           non-deterministic. Determinism matters more than diversity
-           once the request already implies "give me everything".
-    [FIX]  System prompt: forbids the "(Same as Error Code X)" shorthand
-           in tables. Verified bug: the model used this shorthand for
-           E-10C and E-10D, claiming they shared E-10B's correction text
-           — they actually match E-10A's wording instead (E-10B has an
-           extra "low oil" caveat sentence that E-10A/C/D/F don't). Also
-           saw E-41P and E-41S's DISPLAY labels swapped in the same
-           answer. Both errors came from the model collapsing near-
-           duplicate rows instead of transcribing each one independently
-           — now it must write out full text per row.
+    [TUNE] COMPREHENSIVE_TOP_K_CHUNKS: 20 → higher
+    [FIX]  rewrite_query() temperature=0 for comprehensive requests
+           (determinism over diversity once "give me everything" is implied)
+    [FIX]  System prompt forbids "(Same as Error Code X)" shorthand —
+           verified to cause real mislabeling between near-duplicate rows
+
+  Round 7 — Structured JSON Output + Universal Recall + Efficiency:
+    [PROMPT] Rebuilt the prompt around the user-supplied JSON contract:
+             every answer is classified into one of four shapes — Relevant
+             ({"Tag": ..., "Response": ...}), Vague/Incomplete, Non-Relevant,
+             or Greeting (all three: {"Response": ...}). All Round 1-6
+             grounding rules (citation, anti-shorthand, partial-info,
+             format-requirement decoupling) now apply specifically to how
+             the Response field is composed for Relevant Queries.
+    [FIX]    Native JSON mode requested from the API (response_format=
+             {"type": "json_object"}) when the installed langchain-mistralai
+             supports it, with a defensive fallback to prompt-only JSON
+             instructions otherwise — belt-and-suspenders for valid output.
+    [FIX]    _parse_json_answer(): three-level fallback (strict json.loads
+             → tolerant regex extraction → raw passthrough) so a малformed
+             or imperfectly-escaped JSON response never produces a blank or
+             crashed answer.
+    [FIX]    Streaming redesigned to buffer the full JSON response, parse
+             it once it's complete and validated, then reveal the
+             guaranteed-correct final text in small increments for a smooth
+             "typing" animation. Naively live-streaming raw partial JSON
+             was considered and rejected: the UI can only ever APPEND
+             yielded text (never replace it), so any approximate live
+             unescaping that later turned out wrong would have permanently
+             corrupted the stored chat history — not an acceptable trade
+             for a cosmetic animation. Time-to-first-byte through the API
+             is unaffected; only what we do with the bytes changed.
+    [FIX]    New _retrieve_with_recall_fallback(): if the topic is actually
+             in the document, a question about it should get an answer
+             regardless of exact phrasing. Escalates through up to three
+             retrieval attempts — normal k, then a much wider k with the
+             same (rewritten) query, then the wider k again with the user's
+             RAW original question (bypassing rewriting/keyword-stripping
+             entirely) — stopping as soon as one attempt clears a minimum
+             usefulness bar, so a single thin/empty retrieval no longer
+             leads straight to "not available".
+    [FIX]    extract_text_from_bytes/pdf no longer collapse ALL whitespace
+             (including newlines) into single spaces. That collapsed every
+             page into one undifferentiated blob of text, destroying the
+             very table-row/list-item structure later rounds depend on to
+             extract clean tables. Now only intra-line whitespace runs are
+             collapsed and excessive blank lines are tamed; line breaks
+             that mark structure are preserved.
+    [PERF]   _get_llm(): ChatMistralAI clients are now created once per
+             (model, temperature, max_tokens, json_mode) combination and
+             reused, instead of constructing a brand-new client on every
+             single rewrite_query() call.
+    [PERF]   Debug prints replaced with logging.debug() calls — near-zero
+             cost when the host app doesn't enable DEBUG logging, instead
+             of unconditionally writing to stdout on every request.
 
 Steps:
   Step 2 → Extract text from PDF
   Step 3 → Chunk + build hybrid retriever
   Step 5 → Build prompt (system + instructions + format + context + history + question)
   Step 6 → Build LLM chain
-  Step 7 → Rewrite query → retrieve chunks → answer with sources (blocking or streamed)
+  Step 7 → Rewrite query → retrieve chunks (with recall fallback) → answer
+           with sources (blocking or streamed) → parse structured JSON output
 """
 
+import json
+import logging
 import re
 import sys
 from dotenv import load_dotenv
@@ -162,6 +133,11 @@ from langchain_community.retrievers import BM25Retriever
 
 from langchain_core.retrievers import BaseRetriever
 from pydantic import Field
+
+# [PERF] Round 7: module logger instead of unconditional print() calls.
+# Silent by default; the host app can opt in with:
+#   logging.getLogger("logic_file").setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 class EnsembleRetriever(BaseRetriever):
@@ -183,6 +159,19 @@ class EnsembleRetriever(BaseRetriever):
                     all_docs[key] = {"doc": doc, "score": 0.0}
                 all_docs[key]["score"] += weight * (1.0 / (rank + 1))
         sorted_docs = sorted(all_docs.values(), key=lambda x: x["score"], reverse=True)
+        # [FIX] Round 7.6: stamp the computed fusion score onto each doc's
+        # own metadata before returning. Previously this score was computed
+        # and then thrown away — callers only ever saw a flat ranked list
+        # with no sense of HOW MUCH better the top hits were than the
+        # bottom ones. That made a fixed-count cutoff the only lever
+        # available, which can't tell a genuinely strong match (the actual
+        # Basic Operation section) apart from a much weaker one that still
+        # happened to land inside the top N (e.g. an Error Codes chunk that
+        # shares generic step-by-step phrasing). Exposing the score lets
+        # _filter_by_relevance_gap() drop weak tail matches regardless of
+        # their numeric rank position.
+        for item in sorted_docs:
+            item["doc"].metadata["_relevance_score"] = item["score"]
         return [item["doc"] for item in sorted_docs]
 
 
@@ -193,66 +182,168 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 if not MISTRAL_API_KEY:
     raise ValueError("MISTRAL_API_KEY not found in .env file!")
 
+# Model kept exactly as configured — not changed in this round.
 MODEL         = "mistral-small-2506"
 CHAR_LIMIT    = 200_000
 
-# Round 1 tuning
-CHUNK_SIZE    = 700      
-CHUNK_OVERLAP = 140      
-TOP_K_CHUNKS  = 7        
-MEMORY_LAST_K = 3        
+# Chunking / retrieval tuning (unchanged from the current configuration)
+CHUNK_SIZE    = 1000
+CHUNK_OVERLAP = 250
+TOP_K_CHUNKS  = 10
+MEMORY_LAST_K = 3
 
-# [MD] Round 2: MAX_TOKENS 1024 → 2048
-# Markdown-formatted answers use more tokens (headings, bullets, spacing).
-# [FIX] Round 4: 2048 → 3072 — a full multi-page error-codes table (40+ rows)
-# was getting cut off mid-table at 2048 tokens.
-MAX_TOKENS    = 3072
+# Markdown-formatted, JSON-wrapped answers need headroom for headings,
+# bullets, tables, and the JSON envelope itself.
+# [FIX] Round 7.1: 3072 -> 6144. Wrapping the answer in a JSON string means
+# every literal double-quote and newline in the Markdown content has to be
+# escaped (" -> \" , newline -> \n), which costs MORE characters than the
+# same content as raw Markdown ever did. A 37-row error-codes table that
+# fit comfortably before was getting cut off mid-table (and mid-word) at
+# the old limit once wrapped in JSON — the model ran out of output budget
+# partway through, silently dropping every row after the cutoff.
+MAX_TOKENS    = 6144
 
-# [CTX] Round 2: Context window budget constants
-# Mistral Small context window = 32,768 tokens.
-# We reserve 28,000 for input (system + history + chunks + instructions)
-# and leave ~4,000+ for the model's output (MAX_TOKENS=3072 + buffer).
-CONTEXT_TOKEN_BUDGET = 28_000
+# Mistral Small context window = 32,768 tokens. Reserve 24,000 for input
+# (system + history + chunks + instructions), leaving ~6,000+ for output
+# (MAX_TOKENS=6144) plus a safety buffer — still comfortably under 32,768
+# combined even in the worst case (24,000 + 6,144 = 30,144).
+CONTEXT_TOKEN_BUDGET = 24_000
 
-# [CTX] Max tokens consumed by retrieved PDF chunks in the prompt.
-# 7 chunks × 700 chars ≈ 1,225 tokens normally, but large pages can spike.
-# Cap at 6,000 tokens (~24,000 chars) to leave room for history + system.
-CHUNK_TOKEN_BUDGET   = 6_000
+# Max tokens consumed by retrieved PDF chunks in the prompt for a normal
+# (non-comprehensive) question.
+CHUNK_TOKEN_BUDGET   = 8_000
 
-# [FIX] Round 4: comprehensive/listing requests need a wider retrieval net.
-# Bug: "give me the error codes table" only retrieved 7-14 chunks (the
-# ensemble's two sub-retrievers each return TOP_K_CHUNKS=7), which isn't
-# enough to cover a table that spans 6 PDF pages — the middle pages of the
-# table were silently dropped, and the model answered from a partial table
-# without saying so clearly. For requests that imply "give me everything"
-# (a table, a comparison, "all of X"), we temporarily widen retrieval.
-COMPREHENSIVE_TOP_K_CHUNKS       = 30
-CHUNK_TOKEN_BUDGET_COMPREHENSIVE = 12_000
+# [FIX] Round 4: comprehensive/listing requests (full tables, comparisons,
+# "all of X") need a much wider retrieval net — a handful of top-ranked
+# chunks covers one fact, not a table spanning several pages.
+COMPREHENSIVE_TOP_K_CHUNKS       = 50
+CHUNK_TOKEN_BUDGET_COMPREHENSIVE = 18_000
+
+# [DEPRECATED] Round 7.2 introduced this as a middle tier for generic
+# completeness wording ("all", "every"). Round 7.5 removed its usage —
+# widening k to 20 for those generic words genuinely matched scattered
+# pages across most of a procedural manual (every section uses similar
+# step-by-step phrasing), which then got padded into nearly half the
+# document. Left defined in case a future, more targeted use is found;
+# _prepare_pipeline_inputs() no longer references it.
+MODERATE_TOP_K_CHUNKS = 20
+
+# [FIX] Round 7: minimum amount of retrieved content (in characters) before
+# we trust a retrieval pass enough to skip the recall-fallback escalation.
+# Deliberately small — this only needs to catch the "basically nothing
+# came back" case, not second-guess every modest-but-valid retrieval.
+MIN_USEFUL_RETRIEVAL_CHARS = 200
+
+# [FIX] Round 7.5: EnsembleRetriever merges BM25+FAISS results with no
+# final cutoff of its own — every unique chunk either sub-retriever
+# surfaced within its OWN k gets returned, so even the default k=10 per
+# sub-retriever can yield up to ~20 merged candidates. Generic step-by-
+# step phrasing ("press the button", "follow the steps") that's common
+# across an entire procedural manual let marginal matches from unrelated
+# sections slip into that long tail. For normal (non-comprehensive)
+# questions, only the top DEFAULT_FINAL_TOP_N merged candidates are kept
+# before any padding — comprehensive/expand_sections requests skip this
+# cap since they're intentionally meant to be broad.
+DEFAULT_FINAL_TOP_N = 5
+
+# [FIX] Round 7.6: a purely STRUCTURAL safety ceiling, independent of any
+# ranking score. Generic procedural phrasing ("press the button", "follow
+# the steps") repeats throughout a technical manual, and can occasionally
+# rank a chunk from a FAR AWAY, unrelated section highly enough to survive
+# rank-based filtering (DEFAULT_FINAL_TOP_N, padding's top_n). Related
+# content in a well-organized manual is almost always within a handful of
+# pages of the single most confident match — anything farther than this
+# from that anchor page is dropped for non-comprehensive questions,
+# regardless of how it scored. See _restrict_to_anchor_locality().
+MAX_PAGE_DISTANCE_FROM_ANCHOR = 8
 
 
-# ── [CTX] Token estimation helper ────────────────────────────────────────────
-def estimate_token_count(text: str) -> int:
+# ── [PERF] Round 7: cached LLM clients ─────────────────────────────────────────
+_llm_cache: dict = {}
+
+
+def _get_llm(model: str, temperature: float, max_tokens: int, json_mode: bool = False):
     """
-    [CTX] Rough token estimator: 1 token ≈ 4 characters (industry standard
-    approximation for English/technical text without running a full tokenizer).
+    [PERF] Round 7: lazily creates and reuses ChatMistralAI client objects
+    instead of constructing a brand-new one on every call — the previous
+    rewrite_query() built a fresh client every single time it ran.
 
-    Used to dynamically budget context window usage before invoking the chain,
-    preventing silent truncation when history + chunks + prompts exceed 32k.
+    [FIX] Round 7: when json_mode=True (used for the main answer chain),
+    requests native JSON-object output from the API via response_format.
+    This is a defensive best-effort: if the installed langchain-mistralai
+    version doesn't accept that kwarg, we transparently fall back to a
+    plain client and rely on the prompt instructions + the tolerant
+    _parse_json_answer() fallback chain instead. Either way, output is
+    never blocked by this — it only improves the odds of clean JSON.
     """
-    return max(1, len(text) // 4)
+    key = (model, temperature, max_tokens, json_mode)
+    if key in _llm_cache:
+        return _llm_cache[key]
+
+    base_kwargs = dict(
+        api_key=MISTRAL_API_KEY,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    llm = None
+    if json_mode:
+        try:
+            llm = ChatMistralAI(**base_kwargs, response_format={"type": "json_object"})
+        except TypeError:
+            logger.debug(
+                "Installed langchain-mistralai doesn't accept response_format; "
+                "falling back to prompt-only JSON instructions."
+            )
+    if llm is None:
+        llm = ChatMistralAI(**base_kwargs)
+
+    _llm_cache[key] = llm
+    return llm
 
 
 # ── STEP 2: Extract text from PDF ─────────────────────────────────────────────
-def extract_text_from_pdf(pdf_path: str) -> list:
+def _normalize_extracted_text(text: str) -> str:
     """
-    Extracts text page-by-page from a PDF file path.
+    [FIX] Round 7: collapses only INTRA-LINE whitespace runs (repeated
+    spaces/tabs) and tames excessive blank lines, but preserves real line
+    breaks.
+
+    Bug this fixes: an earlier version replaced ALL whitespace (including
+    every newline) with a single space, which flattened each page into one
+    undifferentiated blob of text. That destroyed the row/list-item
+    structure that later rounds (multi-page table detection, clean
+    Markdown table reconstruction) depend on — a table that reads as
+    distinct rows in the PDF would otherwise become one run-on sentence
+    with no boundaries between "DISPLAY", "CAUSE", and "CORRECTION" values.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)      # collapse repeated spaces/tabs
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)  # trim whitespace around line breaks
+    text = re.sub(r"\n{3,}", "\n\n", text)   # tame excessive blank lines
+    return text.strip()
+
+
+def extract_text_from_bytes(pdf_bytes: bytes) -> list:
+    """
+    Extracts text page-by-page from raw PDF bytes, preserving ligatures,
+    de-hyphenating wrapped words, and clipping to the visible mediabox —
+    while keeping line/row structure intact (see _normalize_extracted_text).
     Returns list of {page, text} dicts for source tracking.
     """
-    doc = fitz.open(pdf_path)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages = []
     for page_num, page in enumerate(doc, start=1):
-        text = page.get_text("text").strip()
-        if text:
+        text = page.get_text(
+            "text",
+            flags=fitz.TEXT_PRESERVE_LIGATURES
+            | fitz.TEXT_PRESERVE_WHITESPACE
+            | fitz.TEXT_MEDIABOX_CLIP
+            | fitz.TEXT_DEHYPHENATE,
+        )
+        text = _normalize_extracted_text(text)
+        if len(text) > 50:  # ignore near-empty pages
             pages.append({"page": page_num, "text": text})
     doc.close()
     if not pages:
@@ -260,16 +351,20 @@ def extract_text_from_pdf(pdf_path: str) -> list:
     return pages
 
 
-def extract_text_from_bytes(pdf_bytes: bytes) -> list:
-    """
-    Extracts text page-by-page from raw PDF bytes.
-    Returns list of {page, text} dicts for source tracking.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+def extract_text_from_pdf(pdf_path: str) -> list:
+    """CLI version of extract_text_from_bytes."""
+    doc = fitz.open(pdf_path)
     pages = []
     for page_num, page in enumerate(doc, start=1):
-        text = page.get_text("text").strip()
-        if text:
+        text = page.get_text(
+            "text",
+            flags=fitz.TEXT_PRESERVE_LIGATURES
+            | fitz.TEXT_PRESERVE_WHITESPACE
+            | fitz.TEXT_MEDIABOX_CLIP
+            | fitz.TEXT_DEHYPHENATE,
+        )
+        text = _normalize_extracted_text(text)
+        if len(text) > 50:
             pages.append({"page": page_num, "text": text})
     doc.close()
     if not pages:
@@ -278,24 +373,76 @@ def extract_text_from_bytes(pdf_bytes: bytes) -> list:
 
 
 # ── STEP 3: Chunk + Build Hybrid Retriever ────────────────────────────────────
+def _is_toc_like_chunk(text: str) -> bool:
+    """
+    [FIX] Round 7.4: heuristically detects a Table-of-Contents-style chunk
+    — dominated by lines like "1-1 Safety .......................... 1"
+    (a title followed by dot-leaders/whitespace and a trailing page
+    number) or numbered section headers ("2-3 Selecting the Location").
+
+    Concrete bug this fixes: "give me all basic operations in detail"
+    retrieved the actual Table of Contents page alongside the real Basic
+    Operation content, because the TOC literally contains the words
+    "Basic Operation" (it's an entry in it) plus dozens of other section
+    titles. The model then tried to exhaustively enumerate every title it
+    saw there — generating empty "please refer to the X section" filler
+    for sections completely unrelated to what was asked, repeated several
+    times over. A TOC entry is a navigation aid (title -> page number), not
+    real content, so it's excluded from the index entirely rather than
+    relying on the model to ignore it (the model demonstrably didn't).
+
+    Conservative by design (>=50% of a chunk's non-empty lines need to
+    match) so a normal numbered-steps procedure — which starts with a
+    digit but ends in actual instruction text, not a page number — is not
+    mistaken for one.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 5:
+        return False
+    toc_like = sum(
+        1 for l in lines
+        if re.search(r"[.\s]{2,}\d{1,4}\s*$", l)                   # "Title .......... 42"
+        or re.match(r"^\d+(-\d+)*\.?\s+[A-Z][A-Za-z ]{2,40}$", l)  # "2-3 SELECTING THE LOCATION"
+    )
+    return (toc_like / len(lines)) >= 0.5
+
+
 def _pages_to_chunks(pages: list) -> tuple:
     """
     Splits page texts into overlapping chunks.
+
+    [FIX] Round 7.4: chunks that are themselves Table-of-Contents-style
+    listings (see _is_toc_like_chunk) are excluded from the index — they
+    contain section TITLES, not section CONTENT, and including them
+    caused the model to try to summarize every title it saw rather than
+    answering the actual question. A page that is ENTIRELY a table of
+    contents (the common case — most manuals have one dedicated TOC page)
+    is therefore dropped from the index entirely, which is the intended,
+    correct outcome here, not a bug: as a navigation aid it was actively
+    harmful to retrieval quality and added no answerable content of its
+    own. The safety net only applies GLOBALLY — if filtering would leave
+    the WHOLE document with zero chunks (a pathological all-TOC PDF),
+    every chunk is kept unfiltered rather than building a broken,
+    contentless retriever.
+
     Returns (chunk_texts, chunk_metadatas) — metadata carries page number.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
     )
-    chunk_texts = []
-    chunk_metas = []
+    all_splits = []        # [(text, page), ...] before TOC filtering
+    filtered_splits = []   # [(text, page), ...] after TOC filtering
 
     for page_data in pages:
-        splits = splitter.split_text(page_data["text"])
-        for split in splits:
-            chunk_texts.append(split)
-            chunk_metas.append({"page": page_data["page"]})
+        for split in splitter.split_text(page_data["text"]):
+            all_splits.append((split, page_data["page"]))
+            if not _is_toc_like_chunk(split):
+                filtered_splits.append((split, page_data["page"]))
 
+    kept = filtered_splits if filtered_splits else all_splits
+    chunk_texts  = [text for text, _ in kept]
+    chunk_metas  = [{"page": page} for _, page in kept]
     return chunk_texts, chunk_metas
 
 
@@ -355,7 +502,7 @@ def load_pdf_from_bytes(pdf_bytes: bytes, filename: str) -> dict:
             f"Large PDF detected — only first {len(pages)} pages were loaded "
             f"({dropped} pages dropped to stay within the {CHAR_LIMIT:,} character limit)."
         )
-        print(f"Warning: {truncation_warning}")
+        logger.debug("Truncation: %s", truncation_warning)
 
     retriever = build_hybrid_retriever(pages)
 
@@ -370,7 +517,7 @@ def load_pdf_from_bytes(pdf_bytes: bytes, filename: str) -> dict:
 
 def load_pdf(pdf_path: str) -> dict:
     """CLI version of load_pdf_from_bytes."""
-    print(f"Loading: {pdf_path}")
+    logger.debug("Loading: %s", pdf_path)
     pages = extract_text_from_pdf(pdf_path)
     truncation_warning = None
 
@@ -388,12 +535,12 @@ def load_pdf(pdf_path: str) -> dict:
             f"Large PDF — kept {len(pages)} pages ({dropped} pages dropped, "
             f"{sum(len(p['text']) for p in pages):,} chars loaded)."
         )
-        print(f"Warning: {truncation_warning}")
+        logger.debug("Truncation: %s", truncation_warning)
 
     retriever = build_hybrid_retriever(pages)
     filename = pdf_path.split("/")[-1]
     chars = sum(len(p["text"]) for p in pages)
-    print(f"Loaded '{filename}' — {chars:,} chars, {len(pages)} pages\n")
+    logger.debug("Loaded '%s' — %d chars, %d pages", filename, chars, len(pages))
 
     return {
         "retriever":          retriever,
@@ -420,54 +567,67 @@ def rewrite_query(question: str, document_type: str = "technical", temperature: 
     #3: Rewrites vague/short user questions into more specific,
     search-friendly queries before retrieval.
 
-    [HAL] temperature: 0 → 0.1
-    A tiny amount of creativity in rewriting produces slightly varied phrasings,
-    which improves retrieval diversity. Better retrieved chunks = more grounded
-    answers = less hallucination. The answer LLM stays at temperature=0.
+    [HAL] A tiny amount of creativity (temperature=0.1) in rewriting
+    produces slightly varied phrasings, improving retrieval diversity for
+    normal single-fact lookups.
 
-    [FIX] Round 6: temperature is now a parameter (default unchanged at 0.1).
-    For comprehensive/listing requests, _prepare_pipeline_inputs() passes 0
-    instead — run-to-run wording variance in the rewritten query was shifting
-    exactly which chunks landed in the initial top-k before the page-range
-    expansion kicked in, occasionally letting a chunk slip through a gap in
-    the detected cluster. Determinism matters more than diversity once the
-    request is "give me everything", not "find the one relevant fact".
+    [FIX] Round 6: comprehensive/listing requests use temperature=0
+    instead (passed in by the caller) — determinism matters more than
+    diversity once the request already implies "give me everything".
 
-    [TUNE] domain-aware: document_type param lets the rewriter use domain
-    terminology (legal, medical, financial, technical) for better expansion.
+    [PERF] Round 7: reuses a cached LLM client (see _get_llm) rather than
+    constructing a new one on every call.
     """
-    llm = ChatMistralAI(
-        api_key=MISTRAL_API_KEY,
-        model=MODEL,
-        temperature=temperature,  # [HAL] 0.1 normally; 0 for comprehensive requests (see above)
-        max_tokens=MAX_TOKENS,
-    )
+    llm = _get_llm(MODEL, temperature, max_tokens=600)
 
-    rewrite_prompt = (
-        f"You are helping retrieve information from a {document_type} document. "
-        "Rewrite the following question to be more specific and search-friendly "
-        f"for retrieving content from this type of document. "
-        "Expand abbreviations, add relevant domain terminology, and make the "
-        "intent explicit. "
-        "Return ONLY the rewritten question, nothing else.\n\n"
-        f"Original: {question}\n"
-        "Rewritten:"
-    )
+    rewrite_prompt = f"""
+You are an expert RAG query re-writer for technical operator manuals and equipment documents.
 
-    result = llm.invoke(rewrite_prompt)
-    rewritten = result.content.strip()
-    return rewritten if rewritten else question
+Your job is to understand the user's real intent and convert it into the most effective search query.
+
+Rules:
+- Capture the core topic accurately
+- If the question already closely matches an actual section title or specific
+  procedure name in this kind of document (e.g. "basic operations" closely
+  matching a section literally titled "Basic Operation"), preserve that exact
+  phrase as the anchor of the rewrite — do not dilute it with generic words.
+  Generic terms like "instructions"/"settings"/"controls"/"operation" appear
+  in MANY unrelated sections of a technical manual (e.g. "Filter Control",
+  "Special Programming"), so padding a specific query with them can drift
+  retrieval toward the wrong section entirely.
+- Add technical keywords and synonyms that are SPECIFIC and DISTINCTIVE to
+  the topic asked about, not generic ones that could match many sections.
+- Make it concise but information-rich
+- Do not add any explanation or extra words
+
+Examples:
+- "give me the error code table" -> "error codes table E- display cause correction troubleshooting"
+- "error code table" -> "error codes E- cause correction display list"
+- "show all error codes" -> "error codes full list E- troubleshooting"
+- "how to filter the oil" -> "filtering instructions filter envelope clean-out mode"
+- "what is the capacity" -> "pot capacity specifications"
+- "give me the basic operations" -> "basic operation startup procedure POWER switch frypot oil DROP button load product press start cook cycle"
+- "give me all basic operations in detail" -> "basic operation startup procedure POWER switch frypot oil DROP button load product press start cook cycle end of cycle"
+
+User Question: {question}
+Rewritten Query (return ONLY the query):"""
+
+    try:
+        result = llm.invoke(rewrite_prompt)
+        rewritten = result.content.strip()
+        logger.debug("Rewrite: %r -> %r (temp=%s)", question, rewritten, temperature)
+        return rewritten if rewritten else question
+    except Exception:
+        logger.debug("Rewrite failed, using original question: %r", question, exc_info=True)
+        return question
 
 
 # ── #4: Retrieve chunks with source pages ─────────────────────────────────────
 def _boost_retriever_k(retriever, new_k: int) -> list:
     """
     [FIX] Round 4: temporarily increases how many chunks each sub-retriever
-    returns for a single call. Used for comprehensive/listing requests
-    (e.g. "give me the full error codes table") where the default
-    TOP_K_CHUNKS=7 per sub-retriever isn't enough to cover a table that
-    spans several pages — mutating .k / .search_kwargs in place is cheap
-    (no re-embedding needed) since the FAISS vectorstore itself is unchanged.
+    returns for a single call (mutating .k / .search_kwargs in place is
+    cheap — no re-embedding needed since the FAISS vectorstore is unchanged).
 
     Returns a list of (object, attr_name, original_value) tuples so the
     caller can restore the original settings via _restore_retriever_k().
@@ -503,13 +663,118 @@ class _SimpleDoc:
         self.metadata = {"page": page}
 
 
+def _pad_adjacent_pages(retriever, retrieved_docs: list, pad: int = 1, top_n: int = 3) -> list:
+    """
+    [FIX] Round 7.3: many sections in a technical manual span 2+ consecutive
+    pages (a numbered procedure that continues "(CONT.)" on the next page,
+    a table split across a page break, etc). A chunk's individual
+    relevance score has no notion of this structural continuity — the
+    chunk holding the LATER half of a procedure can rank well on its own
+    distinctive action words, while the chunk holding the EARLIER half
+    (often just setup steps or an intro sentence) scores lower and gets
+    left out, even though it's the very next/previous page of a
+    confident hit.
+
+    Concrete bug this fixes: "give me basic operations" retrieved the
+    chunk covering steps 4-10 of a 10-step procedure, but never the chunk
+    covering steps 1-3 on the page before it — even widening k did not
+    help, because that chunk genuinely ranked low for the query, not just
+    outside an arbitrary cutoff.
+
+    [FIX] Round 7.4: a page can be split into MULTIPLE chunks (with
+    CHUNK_SIZE=1000, a ~1,500-char page like this one's "Basic Operation"
+    section becomes 2 chunks). The original version of this function only
+    backfilled pages with ZERO chunks already retrieved — so if chunk 2 of
+    page 24 (steps ~4-7) was retrieved, page 24 already counted as
+    "present" and chunk 1 of that SAME page (the intro + steps 1-3) was
+    never backfilled, even though it's a completely different, still-
+    missing chunk. Now every chunk within the padded page range is
+    considered, and only an EXACT text duplicate is skipped — so a
+    partially-retrieved page gets its remaining chunks filled in too, not
+    just genuinely new neighboring pages.
+
+    [FIX] Round 7.5: top_n bounds WHICH retrieved chunks get padded.
+    retrieved_docs is sorted by descending confidence (EnsembleRetriever
+    returns it that way) — only the top_n highest-confidence chunks are
+    used to decide which pages to pad around. Bug this fixes: "give me
+    all basic operations in detail" widened retrieval to k=20 per
+    sub-retriever for the generic word "all", which genuinely matched
+    pages scattered across most of the manual's procedural sections
+    (Filtering, Clean-Out, Programming, Troubleshooting, Error Codes —
+    all share similar step-by-step phrasing). Padding around EVERY one of
+    those 20-40 candidate pages turned a 2-page answer into nearly half
+    the manual, which then got cut off by the token limit anyway. Padding
+    only the top few confident hits keeps the answer scoped to what's
+    actually relevant, while a wide k is still free to do its job of
+    finding the right content in the first place — recall and padding
+    are now decoupled.
+
+    Unlike _expand_to_full_section (which can pull in an unboundedly large
+    page range once ANY loose cluster is detected, and is therefore only
+    enabled for explicit table/comparison/listing requests), this is
+    deliberately narrow: only ±`pad` pages around the top `top_n` most
+    confident chunks are added, so the worst case is a small, predictable
+    amount of extra context — never a runaway expansion across the document.
+    """
+    all_chunks = getattr(retriever, "all_chunks", None)
+    if not all_chunks:
+        return retrieved_docs
+
+    top_docs = retrieved_docs[:top_n]
+    pages_present = {doc.metadata.get("page") for doc in top_docs if doc.metadata.get("page")}
+    if not pages_present:
+        return retrieved_docs
+
+    wanted_pages = {p + delta for p in pages_present for delta in range(-pad, pad + 1)}
+    already_have = {doc.page_content for doc in retrieved_docs}
+
+    padded = list(retrieved_docs)
+    for text, page in all_chunks:
+        if page in wanted_pages and text not in already_have:
+            padded.append(_SimpleDoc(text, page))
+            already_have.add(text)
+    return padded
+
+
+def _restrict_to_anchor_locality(
+    docs: list, anchor_page, max_distance: int = MAX_PAGE_DISTANCE_FROM_ANCHOR
+) -> list:
+    """
+    [FIX] Round 7.6: a final, structural safety ceiling for non-comprehensive
+    questions — applied AFTER the top-N cutoff and scoped padding, as a
+    last line of defense.
+
+    Concrete bug this fixes: "give me all basic operations in detail"
+    still pulled in content from Programming, Troubleshooting, and the
+    full Error Codes table (40+ pages away from Basic Operation), even
+    after rank-based filtering — because BM25's keyword overlap on
+    generic procedural phrasing ("press the button", "follow the steps",
+    "check the connection") repeats throughout the manual and can rank a
+    handful of distant chunks highly enough to survive a rank cutoff.
+
+    This rule is deliberately NOT rank-based: related content in a
+    well-organized technical manual is almost always within a handful of
+    pages of the single most confident match (`anchor_page`, the page of
+    the very first result the retriever returned, before any cutoff or
+    padding touched the list). Anything farther than `max_distance` pages
+    from that anchor is dropped outright, regardless of its score —
+    closing the loophole that purely rank-based filtering can't.
+    """
+    if anchor_page is None:
+        return docs
+    return [
+        doc for doc in docs
+        if doc.metadata.get("page") is None
+        or abs(doc.metadata.get("page") - anchor_page) <= max_distance
+    ]
+
+
 def _cluster_pages(pages: list, max_gap: int = 2) -> list:
     """
     [FIX] Round 5: groups a list of page numbers into clusters where
     consecutive pages are within `max_gap` of each other. Lets us tell the
     difference between "these chunks all belong to one contiguous document
-    section" (e.g. a multi-page error-codes table) versus "these chunks
-    are scattered across unrelated pages" (the normal case).
+    section" versus "these chunks are scattered across unrelated pages".
     """
     if not pages:
         return []
@@ -528,15 +793,7 @@ def _expand_to_full_section(retriever, retrieved_docs: list) -> list:
     [FIX] Round 5: after a comprehensive retrieval pass, check whether the
     retrieved pages cluster into one contiguous section. If so, pull in
     EVERY chunk from that page range out of retriever.all_chunks — not
-    just whichever ones happened to rank inside the (already widened)
-    top-k.
-
-    Concrete bug this fixes: "give me the error codes table" retrieved
-    most of a 6-page error-code table (pages 60-65) even with a boosted
-    k=20, but a handful of specific rows (e.g. E-14, E-6B, E-93) still
-    didn't make the cut because their individual chunk ranked just outside
-    the top-20. Expanding to the full detected page range guarantees
-    nothing in that section is silently dropped.
+    just whichever ones happened to rank inside the (already widened) top-k.
 
     Small or non-clustered page sets (the normal case for most questions)
     are left untouched — this only kicks in once a real multi-page section
@@ -551,9 +808,6 @@ def _expand_to_full_section(retriever, retrieved_docs: list) -> list:
     if not clusters:
         return retrieved_docs
 
-    # Only expand the single largest cluster — that's almost certainly the
-    # section the user is actually asking about. Small 1-2 page clusters
-    # aren't worth expanding (most questions only need 1-2 pages anyway).
     largest = max(clusters, key=len)
     if len(largest) < 3:
         return retrieved_docs
@@ -569,39 +823,69 @@ def _expand_to_full_section(retriever, retrieved_docs: list) -> list:
     return expanded
 
 
-def retrieve_with_sources(retriever, question: str, k_override: int = None) -> tuple:
+def retrieve_with_sources(
+    retriever, question: str, k_override: int = None, expand_sections: bool = False
+) -> tuple:
     """
     #4: Retrieves relevant chunks and extracts source page numbers.
 
     [FIX] Round 4: k_override temporarily widens retrieval for this single
-    call (see _boost_retriever_k) — used for comprehensive/listing requests
-    where the default top-k is too narrow to cover a multi-page table.
-    Settings are restored immediately after, so normal questions are
-    unaffected.
+    call — used for comprehensive/listing requests where the default
+    top-k is too narrow to cover a multi-page table. Settings are restored
+    immediately after, so normal questions are unaffected.
 
-    [FIX] Round 5 (only when k_override is set, i.e. comprehensive mode):
-      - _expand_to_full_section() backfills any chunks missed by ranking
-        alone, once a multi-page section is detected.
-      - Chunks are then sorted by page number so a multi-page table reads
-        in document order instead of jumping around in relevance-rank order.
-      - Each chunk is labelled "[PDF Page N]" before being joined into the
-        context. The model is instructed (see build_langchain_prompt) to
-        cite USING THIS LABEL rather than any page number printed inside
-        the document's own header/footer text, which is frequently
-        different from the true PDF page index (e.g. front-matter/cover
-        pages shift a document's internal page numbering by several
-        pages). Without this, the "Sources: Page N" tags shown in the UI
-        and the "(Page N)" citations inside the answer text can disagree
-        about which page something is on.
+    [FIX] Round 7.3: every retrieval (not just comprehensive ones) is now
+    padded with the immediately adjacent page(s) of whatever got retrieved
+    — see _pad_adjacent_pages(). This is intentionally small and bounded
+    (±1 page per retrieved page), unlike full section expansion, so it's
+    safe to apply universally without reintroducing the Round 7.2
+    over-broad-expansion regression.
+
+    When expand_sections=True (strong-signal requests only):
+      - _expand_to_full_section() additionally backfills any chunks
+        missed by ranking alone, once a genuine multi-page section is
+        detected (an unbounded range, unlike the padding above).
+
+    When expand_sections=False (normal questions): after padding,
+    _restrict_to_anchor_locality() drops anything farther than
+    MAX_PAGE_DISTANCE_FROM_ANCHOR pages from the single highest-ranked
+    original hit — a structural ceiling, not a rank-based one, that
+    closes the gap rank-based filtering alone couldn't (see that
+    function's docstring for the concrete bug this fixes).
+
+    Chunks are always sorted by page number before being joined into
+    context — reading in document order (rather than relevance-rank
+    order) makes it far easier for the model to recognize that two
+    excerpts continue the same numbered procedure or table, instead of
+    treating them as unrelated fragments.
+
+    Every chunk is labelled "[PDF Page N]" using the TRUE PDF index before
+    being joined into context — the model is instructed to cite using
+    this label rather than any page number printed inside the document's
+    own header/footer text.
 
     Returns (combined_context_text, sorted_unique_page_numbers).
     """
     restores = _boost_retriever_k(retriever, k_override) if k_override else []
     try:
         docs = retriever.invoke(question)
-        if k_override:
+        anchor_page = docs[0].metadata.get("page") if docs else None
+
+        if not expand_sections:
+            # [FIX] Round 7.5: cap to genuinely top-ranked chunks for normal
+            # questions — see DEFAULT_FINAL_TOP_N. Comprehensive/expand_sections
+            # requests intentionally skip this cap.
+            docs = docs[:DEFAULT_FINAL_TOP_N]
+
+        docs = _pad_adjacent_pages(retriever, docs, pad=1)
+
+        if expand_sections:
             docs = _expand_to_full_section(retriever, docs)
-            docs = sorted(docs, key=lambda d: d.metadata.get("page") or 0)
+        else:
+            # [FIX] Round 7.6: structural ceiling, see _restrict_to_anchor_locality.
+            docs = _restrict_to_anchor_locality(docs, anchor_page)
+
+        docs = sorted(docs, key=lambda d: d.metadata.get("page") or 0)
     finally:
         if restores:
             _restore_retriever_k(restores)
@@ -622,36 +906,135 @@ def retrieve_with_sources(retriever, question: str, k_override: int = None) -> t
     return context, source_pages
 
 
-# ── [FIX] Round 4: Comprehensive/listing request detection ────────────────────
-def _wants_comprehensive_listing(question: str) -> bool:
+# ── [FIX] Round 7: Universal recall fallback ───────────────────────────────────
+def _retrieve_with_recall_fallback(
+    retriever, search_query: str, raw_question: str,
+    base_k_override: int = None, base_expand_sections: bool = False,
+) -> tuple:
     """
-    True when the user is asking for an exhaustive listing (a full table, a
-    complete comparison, "all of X") rather than a quick single-fact lookup.
+    [FIX] Round 7: if a topic genuinely exists in the document, a question
+    about it should get an answer no matter how the question happens to be
+    phrased. A single retrieval pass occasionally comes back empty or
+    razor-thin — e.g. the rewritten query drifted from the source's exact
+    terminology — and previously that went straight to "not available"
+    with no second attempt.
 
-    These requests need a wider retrieval net: a handful of top-ranked
-    chunks is fine for "what's the cook temperature for wings", but a
-    request for "the error codes table" implicitly means ALL error codes,
-    which can span many chunks across several pages. A bare table or
-    comparison request already implies completeness — that's the whole
-    point of asking for a table instead of a quick answer — so it counts
-    on its own, without needing an extra "all"/"complete" word.
+    Escalates through up to three retrieval attempts, stopping as soon as
+    one clears a minimal usefulness bar (some source pages AND a non-trivial
+    amount of text):
+      1. Normal retrieval with the given (rewritten/cleaned) search_query
+         and whatever k_override/expand_sections the caller already
+         decided on.
+      2. The SAME search_query with a much wider net — at this point the
+         baseline already came back thin, so casting wider is worth the
+         risk of some extra noise. Crucially, this does NOT force on full
+         section expansion for a normal question: expand_sections stays
+         whatever the ORIGINAL caller intended (base_expand_sections).
+         [FIX] Round 7.6: this used to hardcode expand_sections=True for
+         every escalation, regardless of the original request — which
+         meant a normal question whose first attempt landed at, say, 199
+         characters (one under the threshold) would escalate straight
+         into the unbounded full-section-expansion path, bypassing the
+         structural locality ceiling entirely (see
+         _restrict_to_anchor_locality). Only a genuine full_expansion
+         request (table/comparison/error-codes) should ever get the
+         unbounded treatment.
+      3. The user's RAW original question — bypassing rewriting and
+         format-keyword-stripping entirely — in case either step
+         accidentally dropped the one term that actually mattered, again
+         with the wider net (same expand_sections behavior as step 2).
+
+    If all three attempts come back thin, returns whichever attempt found
+    the most content, so the model still gets the best available context
+    to judge from honestly rather than the least.
     """
+    attempts = []
+
+    pdf_content, source_pages = retrieve_with_sources(
+        retriever, search_query, k_override=base_k_override, expand_sections=base_expand_sections
+    )
+    attempts.append((pdf_content, source_pages))
+    if source_pages and len(pdf_content.strip()) >= MIN_USEFUL_RETRIEVAL_CHARS:
+        return pdf_content, source_pages
+
+    logger.debug(
+        "Retrieval thin (%d pages, %d chars) for %r — widening the net",
+        len(source_pages), len(pdf_content), search_query,
+    )
+    pdf_content, source_pages = retrieve_with_sources(
+        retriever, search_query, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=base_expand_sections
+    )
+    attempts.append((pdf_content, source_pages))
+    if source_pages and len(pdf_content.strip()) >= MIN_USEFUL_RETRIEVAL_CHARS:
+        return pdf_content, source_pages
+
+    if raw_question.strip().lower() != search_query.strip().lower():
+        logger.debug("Still thin — retrying with the raw, un-rewritten question")
+        pdf_content, source_pages = retrieve_with_sources(
+            retriever, raw_question, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=base_expand_sections
+        )
+        attempts.append((pdf_content, source_pages))
+        if source_pages and len(pdf_content.strip()) >= MIN_USEFUL_RETRIEVAL_CHARS:
+            return pdf_content, source_pages
+
+    return max(attempts, key=lambda pair: len(pair[0]))
+
+
+# ── [FIX] Round 4/7.2: Tiered comprehensive/listing request detection ─────────
+_TABLE_KEYWORDS = ["table", "tabular", "tabulate", "rows and columns"]
+_COMPARE_KEYWORDS = [
+    "difference between", "differences between", "differ from",
+    "compare", "comparison", " vs ", " vs.", " versus ",
+    "contrast between", "similarities and differences",
+]
+_COMPLETENESS_KEYWORDS = [
+    "all ", "every ", "complete", "entire", "full list", "everything",
+    "comprehensive", "list all",
+]
+
+
+def _wants_full_section_expansion(question: str) -> bool:
+    """
+    [FIX] Round 7.2: STRONG signal only — an explicit table/comparison
+    request, or this PDF's error-codes special case. This is the tier that
+    warrants full cluster expansion (_expand_to_full_section), which
+    unconditionally backfills an entire contiguous page range. That's the
+    right call for "give me the error codes table" (a genuine multi-page
+    table), but it is too blunt an instrument to fire on generic phrasing.
+    """
+    q_lower = question.lower().strip()
+    if any(term in q_lower for term in ["error code", "error codes", "e-"]):
+        return True
+    q = f" {q_lower} "
+    return any(kw in q for kw in _TABLE_KEYWORDS + _COMPARE_KEYWORDS)
+
+
+def _wants_broader_recall(question: str) -> bool:
+    """
+    [FIX] Round 7.2: WEAK signal — generic completeness words like "all",
+    "every", "complete" on their own. These often turn out to be casual
+    phrasing ("give me all the basic operations" just means "tell me about
+    basic operations", not "this spans many pages") rather than a genuine
+    multi-page-table request.
+
+    Bug this fixes: "give me all basic operations" used to trigger the
+    SAME full cluster expansion as an explicit table request, which
+    backfilled an entire nearby page range and pulled in unrelated
+    content (e.g. the Error Codes section) alongside the actually-relevant
+    Basic Operation steps. Now this tier only earns a modest k boost
+    (MODERATE_TOP_K_CHUNKS) — more candidates considered, but no blind
+    whole-section backfill.
+    """
+    if _wants_full_section_expansion(question):
+        return True
     q = f" {question.lower().strip()} "
+    return any(kw in q for kw in _COMPLETENESS_KEYWORDS)
 
-    table_keywords = ["table", "tabular", "tabulate", "rows and columns"]
-    compare_keywords = [
-        "difference between", "differences between", "differ from",
-        "compare", "comparison", " vs ", " vs.", " versus ",
-        "contrast between", "similarities and differences",
-    ]
-    completeness_keywords = [
-        "all ", "every ", "complete", "entire", "full list", "everything",
-        "comprehensive", "list all",
-    ]
 
-    has_format_signal = any(kw in q for kw in table_keywords + compare_keywords)
-    has_completeness_signal = any(kw in q for kw in completeness_keywords)
-    return has_format_signal or has_completeness_signal
+def _wants_comprehensive_listing(question: str) -> bool:
+    """Backward-compatible alias — True for either tier. Used only where a
+    single yes/no signal is needed (e.g. choosing the rewrite temperature)."""
+    return _wants_broader_recall(question)
 
 
 # ── #6: [FMT] Format-aware response detection ─────────────────────────────────
@@ -659,8 +1042,8 @@ def detect_response_format(question: str) -> str:
     """
     [FMT] Inspects the user's question for an explicit formatting request
     (table / comparison-difference / paragraph) and returns an instruction
-    string to inject into the prompt so the model actually structures its
-    answer that way, instead of defaulting to its own judgement.
+    string to inject into the prompt, telling the model how to format the
+    content of the JSON "Response" field for this answer.
 
     Returns "" when no specific format is requested — the model falls back
     to the general Markdown instructions already in the system prompt.
@@ -682,45 +1065,42 @@ def detect_response_format(question: str) -> str:
     is_compare   = any(kw in q for kw in compare_keywords)
     is_paragraph = any(kw in q for kw in paragraph_keywords)
 
-    # Comparison takes priority over a bare "table" mention (a comparison
-    # request implies a table anyway, with a more specific structure).
     if is_compare:
         return (
             "FORMAT REQUIREMENT: The user is asking for a COMPARISON or "
-            "DIFFERENCE between two or more items. Present the answer as a "
-            "single Markdown table with the items being compared as columns "
-            "and the comparison aspects as rows "
-            "(e.g. `| Aspect | Item A | Item B |`), so each difference is "
-            "clearly partitioned and easy to scan side-by-side. Add a short "
-            "summary sentence after the table only if it adds value. Only "
+            "DIFFERENCE between two or more items. Inside the Response "
+            "field, present the answer as a single Markdown table with the "
+            "items being compared as columns and the comparison aspects as "
+            "rows (e.g. `| Aspect | Item A | Item B |`), so each difference "
+            "is clearly partitioned and easy to scan side-by-side. Only "
             "fall back to a clearly labelled bullet list per item if a "
-            "tabular layout genuinely does not fit the content. This formatting "
-            "requirement does NOT override the partial-information rule above: "
-            "build the best possible comparison from whatever is available "
-            "rather than declining — only say the information is unavailable "
-            "if it is truly absent from the retrieved content."
+            "tabular layout genuinely does not fit. This requirement does "
+            "NOT override the partial-information rule: build the best "
+            "possible comparison from whatever is available rather than "
+            "declining — only state the information is unavailable if it "
+            "is truly absent from the retrieved content."
         )
 
     if is_table:
         return (
             "FORMAT REQUIREMENT: The user explicitly asked for a TABLE. "
-            "You MUST respond using a single, well-structured Markdown table "
-            "with clear column headers (e.g. `| Column A | Column B |`). "
-            "Do not substitute bullet points or prose for the table. "
-            "This formatting requirement does NOT override the partial-information "
-            "rule above: if the relevant content is fragmented or incomplete, still "
-            "build the best possible table from what is available rather than "
-            "declining — only say the information is unavailable if it is truly "
-            "absent from the retrieved content, not merely because the table is "
-            "imperfect."
+            "Inside the Response field, you MUST present the answer using "
+            "a single, well-structured Markdown table with clear column "
+            "headers (e.g. `| Column A | Column B |`). Do not substitute "
+            "bullet points or prose for the table. This requirement does "
+            "NOT override the partial-information rule: if the relevant "
+            "content is fragmented, still build the best possible table "
+            "from what is available — only state the information is "
+            "unavailable if it is truly absent, not merely because the "
+            "table is imperfect."
         )
 
     if is_paragraph:
         return (
             "FORMAT REQUIREMENT: The user explicitly asked for a "
-            "PARAGRAPH-style answer. Respond in flowing prose paragraphs. "
-            "Do NOT use bullet points, numbered lists, or tables for this "
-            "answer."
+            "PARAGRAPH-style answer. Inside the Response field, respond in "
+            "flowing prose paragraphs. Do NOT use bullet points, numbered "
+            "lists, or tables for this answer."
         )
 
     return ""
@@ -743,12 +1123,6 @@ def _strip_format_keywords(question: str) -> str:
     (BM25) search isn't polluted by meta-words about HOW to format the
     answer rather than WHAT the answer is about.
 
-    Concrete bug this fixes: "Give me the error codes table" was BM25
-    keyword-matching the unrelated "TABLE OF CONTENTS" page purely because
-    both contain the literal word "table", diluting the actually-relevant
-    Error Codes pages out of the top results and causing the model to
-    (incorrectly) report the information as unavailable.
-
     The ORIGINAL question (with "table" intact) is still used for the final
     answer prompt and for detect_response_format() — only the text handed
     to rewrite_query()/the retriever is cleaned.
@@ -763,115 +1137,179 @@ def _strip_format_keywords(question: str) -> str:
 # ── STEP 5: Build prompt ──────────────────────────────────────────────────────
 def build_langchain_prompt() -> ChatPromptTemplate:
     """
-    Step 5: Builds the ChatPromptTemplate with all tuned prompt components.
+    Step 5: Builds the ChatPromptTemplate.
 
-    Round 1 changes:
-      - System prompt: partial-info clause added
-      - Human prompt: page citation enforcement added
-
-    Round 2 changes:
-      [MD]  System prompt: explicit Markdown formatting instruction added
-      [MD]  Human prompt footer: "Respond in well-structured Markdown" added
-      [HAL] System prompt: uncertainty signalling clause added
-            — model must say "I am not certain" instead of guessing confidently
-      [HAL] Human prompt: [Low Confidence] prefix instruction added
-            — gives the model an explicit escape hatch for borderline answers
-
-    Round 3 changes:
-      [FMT] Human prompt: {format_instruction} placeholder added — filled in
-            by detect_response_format() per-question (table / comparison /
-            paragraph), or left blank when no specific format was requested.
+    [PROMPT] Round 7: rebuilt around the user-supplied JSON contract — every
+    answer is one of four shapes (Relevant / Vague-Incomplete / Non-Relevant
+    / Greeting). All grounding rules accumulated through Rounds 1-6
+    (strict-context-only, partial-info vs not-available mutual exclusivity,
+    page citation via the "[PDF Page N]" label, no "(Same as X)" shorthand,
+    FORMAT REQUIREMENT decoupling) now apply specifically to how the
+    Response field is composed for Relevant Queries — they're folded in
+    rather than dropped, since none of them conflict with the JSON shape.
     """
 
-    # ── System Prompt ──────────────────────────────────────────────────────────
-    # [MD]  Added: markdown formatting instruction
-    # [HAL] Added: uncertainty signalling instruction
-    # Round 1: partial-info clause already present
     system_prompt = (
-        "You are a precise document assistant. "
-        "Your ONLY source of truth is the PDF content provided by the user. "
-        "Never use external knowledge or make assumptions beyond "
-        "what is explicitly stated in the document. "
+        "You are an advanced AI assistant responsible for providing responses to "
+        "user questions based ONLY on the given PDF context. Never use external "
+        "knowledge or information not present in the provided context — if "
+        "something isn't in the context, treat it as not available. Think step "
+        "by step before answering, and generate all response content in Markdown "
+        "format. "
 
-        # Round 1: partial info
-        "If partial information is available in the document, share what is present "
-        "and clearly state what specific details are missing or not covered. "
+        "Classify every question into exactly one of these four categories, and "
+        "reply with a single raw JSON object — no markdown code fences, no text "
+        "before or after the JSON — in the exact shape shown for that category:\n\n"
 
-        # [HAL] Uncertainty signalling — forces model to flag low-confidence answers
-        # instead of presenting guesses as facts. This is the single most effective
-        # prompt-level hallucination deterrent.
-        "When you are uncertain whether information comes from the document or your "
-        "own training data, explicitly say: 'I am not certain this is stated in the "
-        "document — please verify on the relevant page.' "
-        "Never present inferred or assumed information as if it were stated in the document. "
+        "1. RELEVANT QUERY: the question relates to the document and the context "
+        "below contains relevant information, even if only partial. Determine a "
+        "concise, Title Case Tag that categorizes the question (for example: "
+        "\"Warranty\", \"Installation\", \"General Inquiry\", \"Troubleshooting\", "
+        "\"Error Codes\", \"Cleaning Instructions\", \"Unpacking Instructions\", "
+        "\"Specifications\"). Provide a detailed, professional Response built "
+        "strictly from the context — e.g. if asked for a table of contents, error "
+        "codes, or any other listing, reproduce it in full detail rather than "
+        "summarizing it away. Shape: "
+        '{{"Tag": "<Title Case category>", "Response": "<detailed Markdown answer>"}}\n\n'
 
-        # [MD] Markdown instruction — tells the model HOW to format output
-        "Format all your answers using Markdown. Use ## headings for sections, "
-        "**bold** for key terms, bullet lists for enumerated items, and ``` code blocks ``` "
-        "for any technical content or direct quotes. Always structure longer answers "
-        "with clear sections. When the source material itself is laid out as parallel "
-        "columns (for example a Display/Cause/Correction error table, or an "
-        "Item/Description/Function table), preserve that structure as a Markdown table "
-        "in your answer by default, even if the user did not explicitly ask for a table. "
+        "2. INCOMPLETE OR VAGUE QUERY: the question is unclear, too short, or "
+        "missing detail needed to answer from the document. Shape: "
+        '{{"Response": "<a clarification request, with guidance on how to ask a '
+        'more specific question>"}}\n\n'
 
-        # [FMT] Format requirement compliance
-        "If a FORMAT REQUIREMENT is given below, it overrides your default formatting "
-        "judgement for that specific answer — follow it exactly. A FORMAT REQUIREMENT is "
-        "a presentation instruction ONLY: it never changes whether information is "
-        "available. First decide whether the document contains the answer by looking at "
-        "the PDF CONTENT alone; only after that, apply the requested format to whatever "
-        "you found. Reorganize facts into the requested format even if the source page "
-        "doesn't present them as a clean table, or if the relevant content is split "
-        "across multiple chunks — never respond that the information is unavailable "
-        "merely because fitting it into the requested format takes extra reorganizing. "
+        "3. NON-RELEVANT QUERY: the question doesn't relate to the document's "
+        "subject matter, even if some context text was retrieved alongside it. "
+        "Shape: "
+        '{{"Response": "<a brief, honest reply noting this isn\'t covered by the '
+        'document, plus relevant follow-up questions>"}}\n\n'
 
-        # [FIX] Round 6: forbid the "(Same as X)" shorthand in tables — it
-        # caused real mislabeling (e.g. claiming two error codes shared a
-        # correction when they actually had different wording, because two
-        # entries looked similar at a glance). Writing out each row in full
-        # costs more tokens but removes that entire failure mode.
-        "When listing multiple similar rows in a table (e.g. several rows that share "
-        "very similar but not necessarily identical wording), write out the full text "
-        "for EVERY row from the source content. Never write a shorthand reference like "
-        "'(Same as Error Code X)' or '(See above)' to avoid repeating text — even when "
-        "two rows look similar at a glance, their exact wording can differ in a way "
-        "that matters, and shorthand references have caused incorrect groupings before."
+        "4. GENERAL GREETING: simple greetings like \"Hi\" or \"Hello\" with no "
+        "real question. Shape: "
+        '{{"Response": "<a polite greeting, plus a few example questions the user '
+        'could ask>"}}\n\n'
+
+        "Any follow-up questions you suggest (categories 3 and 4) must be "
+        "questions the provided PDF context can actually answer — never invent "
+        "generic questions unrelated to this specific document. "
+
+        "Rules that apply specifically to RELEVANT QUERY responses: "
+        "If you found ANY relevant information, even if incomplete or scattered "
+        "across multiple pages, share what you found in the Response and clearly "
+        "state what specific details are missing — never claim nothing was found "
+        "if you actually have partial information; stating 'not available' and "
+        "giving a partial answer are mutually exclusive within the same Response. "
+        "Always cite page numbers, e.g. \"(Page 4)\", using the page number given "
+        "in the \"[PDF Page N]\" label right before each excerpt in the context — "
+        "never a page number printed in the document's own header or footer text, "
+        "since that internal numbering frequently differs from the page's true "
+        "position in the PDF file. "
+        "If you are less than fully confident about a specific detail, prefix that "
+        "part with **[Low Confidence]** and say what you're unsure about — but "
+        "scope this to the SPECIFIC missing or uncertain piece only. In a table "
+        "row, if one column's value is genuinely absent from the source (e.g. no "
+        "distinct Cause is given) but another column's value IS clearly present "
+        "(e.g. the Correction text is right there), still include what's "
+        "available — never blank out an entire row as \"not available\" just "
+        "because one of several columns is thin or missing; say only that "
+        "specific column wasn't specified, while still reporting the rest. "
+
+        "COMPLETENESS: if the context contains a list or table that is DIRECTLY "
+        "about what the user asked, the Response must include all of its items — "
+        "never silently stop partway through or skip an item to save space, even "
+        "for a long table. If everything genuinely can't fit, say so explicitly "
+        "rather than quietly omitting items. This applies ONLY to content that "
+        "answers the actual question — it does not mean enumerating every section "
+        "title, list, or table that merely happens to appear nearby in the "
+        "context. "
+
+        "STAY ON TOPIC: some excerpts may be a Table of Contents / section index "
+        "— a list of section TITLES with page numbers and little else. Such an "
+        "excerpt only tells you where to look; never use it as a basis for "
+        "summarizing, listing, or writing filler like \"for information on X, "
+        "see the X section\" about sections the user did not ask about, even if "
+        "their titles appear in the context. The context may also contain "
+        "complete, substantive excerpts from OTHER sections that aren't a TOC "
+        "(e.g. Filtering, Programming, Error Codes alongside a question about "
+        "Basic Operation) because they happened to share some wording with the "
+        "question — when that happens, address ONLY the section(s) the "
+        "question is actually about and ignore the rest entirely, even though "
+        "real content is available for them. Answer only the topic actually "
+        "asked about, and never repeat the same heading, list, or paragraph more "
+        "than once within a single Response. "
+
+        "NUMBERING: when the source presents a sequence of ordered steps where "
+        "doing them in order matters, reproduce them as ONE numbered Markdown "
+        "list (1. 2. 3. ...) in that same order — never convert ordered steps "
+        "into unordered bullets, and never renumber or reorder them. The "
+        "context below may contain the same procedure split across multiple "
+        "excerpts (e.g. one excerpt ends at step 7 and a later excerpt, "
+        "possibly marked \"(CONT.)\", begins at step 8) — when that happens, "
+        "treat them as ONE continuous procedure and continue the numbering "
+        "from the source's own step numbers; never restart a later portion at "
+        "1 or present it as a separate \"Additional Steps\" list. Use bullet "
+        "points only for items that have no inherent order. "
+
+        "TABLE COLUMN FIDELITY: when the source is laid out as parallel columns "
+        "(for example a Display/Cause/Correction error table), preserve that "
+        "structure as a Markdown table by default, even without an explicit "
+        "request for a table. Identify EVERY distinct column before writing any "
+        "row, and map each value to the SAME column it came from — never shift "
+        "values over by one column, merge two columns into one, or drop a "
+        "column's content (most often the longest one, e.g. the correction/"
+        "action text) just because it is long. Example: the source row "
+        '"E-4" "CPU TOO HOT" Control board overheating Turn switch to OFF '
+        "position, then back to ON; if display still shows E04, replace the "
+        'control. — has exactly THREE columns: Display = \'"E-4" "CPU TOO '
+        "HOT\"', Cause = 'Control board overheating', Correction = 'Turn switch "
+        "to OFF position, then back to ON; if display still shows E04, replace "
+        "the control.' — the short phrase right after the quoted display text "
+        "is the Cause; everything after that is the Correction. Never collapse "
+        "Cause and Correction into one cell or omit the Correction text. "
+        "EVERY row must have EXACTLY the same number of `|`-separated cells as "
+        "the header, with no exceptions — a row with fewer cells than the "
+        "header (e.g. only 2 cells in a 3-column table) renders with every "
+        "value shifted into the wrong column. If a particular row's source "
+        "entry is missing a value for one column entirely (not merely thin, "
+        "but truly absent — e.g. an error code with no separate Cause beyond "
+        "its code, only a Correction), still write that row with the SAME "
+        "column count, putting a placeholder like \"Not specified\" in the "
+        "empty cell rather than skipping it. "
+        "PAIRED VARIANTS: when two adjacent rows are clearly two variants of "
+        "the same underlying issue (e.g. one row says \"(Open Circuit)\" and "
+        "the very next says \"(Shorted)\" for the same component, or similar "
+        "obviously-paired labels), the raw extracted text sometimes interleaves "
+        "their bullet points out of order — e.g. \"replace probe\" or a second "
+        "row's label appearing in the middle of the first row's text. Before "
+        "concluding a value is \"Not specified\", check whether the surrounding "
+        "text for the PAIRED row contains content that was clearly meant for "
+        "this row but got extracted out of sequence, and assign it to the "
+        "correct row. Only fall back to \"Not specified\" if no such "
+        "content exists anywhere nearby for that specific row. "
+        "When listing multiple similar "
+        "rows, write out the full text for EVERY row — never use a shorthand "
+        "like '(Same as Error Code X)' to skip repeating text, since similar-"
+        "looking rows can differ in ways that matter and shorthand references "
+        "have caused incorrect groupings before. "
+
+        "If a FORMAT REQUIREMENT is given below, it overrides your default "
+        "formatting judgement for that Response — follow it exactly. A FORMAT "
+        "REQUIREMENT is a presentation instruction ONLY: it never changes whether "
+        "information is available. Decide whether the context contains the answer "
+        "first; only then apply the requested format to whatever you found."
     )
 
-    # ── Human Prompt ───────────────────────────────────────────────────────────
-    # [MD]  Added: "Respond in well-structured Markdown" as final instruction
-    # [HAL] Added: [Low Confidence] prefix instruction
-    # [FMT] Added: {format_instruction} placeholder
-    # Round 1: page citation instruction already present
-    human_prompt = """INSTRUCTIONS:
-- Answer strictly and only from the PDF content provided below.
-- If the document contains NO relevant information at all, respond EXACTLY with:
-  "The information is not available in the document." — and nothing else in that case.
-- If you found ANY relevant information, even if incomplete, scattered across multiple
-  pages, or not laid out as a clean table in the source — do NOT use the sentence above.
-  Share what you found and clearly state what specific details are missing instead.
-  Never combine the exact "not available" sentence with a partial answer in the same
-  response; these two paths are mutually exclusive.
-- Do not use external knowledge, prior training data, or assumptions.
-- Be concise and accurate. Quote or paraphrase directly from the document.
-- Always cite the page number(s) where you found the information, e.g. "(Page 4)" or "(Pages 2, 7)".
-  Use the page number from the "[PDF Page N]" label given right before each excerpt below — never use a
-  page number printed inside the document's own header/footer text, since a document's internal page
-  numbering (e.g. "March 2014 1") often differs from its true position in the PDF file and will not match
-  the source page numbers shown elsewhere in this app.
-- If you are less than fully confident about an answer, prefix it with **[Low Confidence]** and explain what you are unsure about.
-- Respond in well-structured Markdown with headings, bullets, and bold key terms where appropriate.
-
-{format_instruction}
+    human_prompt = """{format_instruction}
 
 {chat_history}
 
-PDF CONTENT:
+Context:
 ---
 {pdf_content}
 ---
 
-QUESTION: {user_question}"""
+Question: {user_question}
+
+Answer (a single raw JSON object only, matching exactly one of the four shapes above — no markdown code fences, no commentary before or after it):"""
 
     prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(system_prompt),
@@ -881,25 +1319,107 @@ QUESTION: {user_question}"""
     return prompt
 
 
+# ── [FIX] Round 7: Structured JSON output parsing ─────────────────────────────
+def _strip_code_fences(text: str) -> str:
+    """Removes a ```json ... ``` or ``` ... ``` wrapper if the model added
+    one despite being told not to."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+_RESPONSE_FIELD_RE = re.compile(r'"Response"\s*:\s*"(.*)"\s*\}\s*$', re.DOTALL)
+_TAG_FIELD_RE = re.compile(r'"Tag"\s*:\s*"([^"]*)"')
+
+
+def _unescape_json_string(s: str) -> str:
+    """Best-effort unescape of common JSON string escapes — tolerant of
+    literal (unescaped) newlines/quotes a model sometimes leaves in despite
+    instructions, which strict json.loads() would reject outright."""
+    s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    s = s.replace('\\"', '"')
+    s = s.replace("\\\\", "\\")
+    return s
+
+
+def _parse_json_answer(raw_text: str) -> dict:
+    """
+    [FIX] Round 7: parses the model's JSON-shaped output with three
+    fallback levels, so a malformed or imperfectly-escaped response never
+    crashes the app or produces a blank answer:
+
+      1. Strict json.loads() — works whenever the model followed the
+         schema correctly (most of the time, especially with native JSON
+         mode enabled — see _get_llm).
+      2. Tolerant regex extraction — recovers "Tag"/"Response" even when
+         the model left a literal unescaped newline or quote inside the
+         Response string, which breaks strict JSON parsing but is
+         trivially recoverable for this known, fixed shape.
+      3. Raw passthrough — if the output isn't JSON-shaped at all, treat
+         the entire raw text as the answer rather than showing nothing.
+
+    Returns a dict with a "response" key (str), and a "tag" key (str)
+    when one was present.
+    """
+    text = _strip_code_fences(raw_text).strip()
+
+    # Level 1: strict parse
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "Response" in parsed:
+            result = {"response": str(parsed["Response"])}
+            if parsed.get("Tag"):
+                result["tag"] = str(parsed["Tag"])
+            return result
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Level 2: tolerant regex extraction
+    match = _RESPONSE_FIELD_RE.search(text)
+    if match:
+        result = {"response": _unescape_json_string(match.group(1))}
+        tag_match = _TAG_FIELD_RE.search(text)
+        if tag_match:
+            result["tag"] = tag_match.group(1)
+        return result
+
+    # Level 3: raw passthrough — never show a blank answer
+    logger.debug("JSON parse fully failed, falling back to raw text passthrough")
+    return {"response": text}
+
+
+def _render_final_answer(parsed: dict) -> str:
+    """
+    Builds the final Markdown text shown to the user: a small category
+    line when a Tag was returned (Relevant Queries only), followed by the
+    Response content. Vague/Non-Relevant/Greeting answers have no Tag and
+    are returned exactly as their Response text.
+    """
+    response = parsed.get("response", "").strip()
+    tag = parsed.get("tag")
+    if tag:
+        return f"**Category:** {tag}\n\n{response}"
+    return response
+
+
 # ── STEP 6: Build chain ───────────────────────────────────────────────────────
 def build_chain():
     """
     Step 6: Prompt -> Mistral -> StrOutputParser.
 
-    [MD] MAX_TOKENS raised to 2048 — markdown answers need more room than
-    plain text (headings, bullets, spacing all consume tokens).
-    temperature=0 stays on the answer LLM for maximum factual accuracy.
+    temperature=0 on the answer LLM for maximum factual accuracy and the
+    most reliable JSON-schema compliance.
 
-    [STREAM] This same chain (a standard LangChain RunnableSequence) supports
-    both .invoke() (blocking, used by ask_question) and .stream() (used by
-    ask_question_stream) — no separate chain needed for streaming.
+    [FIX] Round 7: requests native JSON-object mode where supported (see
+    _get_llm) so the API itself enforces syntactically valid JSON, on top
+    of the prompt instructions and the tolerant parser fallback.
+
+    [STREAM] This same chain supports both .invoke() (blocking, used by
+    ask_question) and .stream() (used by ask_question_stream).
     """
-    llm = ChatMistralAI(
-        api_key=MISTRAL_API_KEY,
-        model=MODEL,
-        temperature=0,         # answer LLM stays deterministic
-        max_tokens=MAX_TOKENS, # [MD] 2048 — enough for structured markdown responses
-    )
+    llm = _get_llm(MODEL, temperature=0, max_tokens=MAX_TOKENS, json_mode=True)
     prompt = build_langchain_prompt()
     parser = StrOutputParser()
     return prompt | llm | parser
@@ -909,8 +1429,6 @@ def build_chain():
 def format_chat_history(chat_history: list, last_k: int = MEMORY_LAST_K) -> str:
     """
     #2: Formats last K chat exchanges into a string for the prompt.
-
-    Round 1: last_k reduced from 5 → 3.
     The caller may pass a lower last_k dynamically when the context budget
     is tight — see [CTX] logic in _prepare_pipeline_inputs().
     """
@@ -939,56 +1457,64 @@ def _prepare_pipeline_inputs(
     returns (chain_inputs_dict, source_pages) ready to hand to chain.invoke()
     or chain.stream().
 
-      #3      -> Rewrite query (domain-aware, temperature=0.1)
-      #1+#5   -> Retrieve relevant chunks via hybrid search
+      #3      -> Rewrite query (domain-aware, deterministic for comprehensive)
+      #1+#5   -> Retrieve relevant chunks via hybrid search, with the
+                 [FIX] Round 7 recall-fallback escalation if the first pass
+                 comes back thin
       #4      -> Extract source page numbers
       [CTX]   -> Budget check: trim chunks and/or history if over limit
       #2      -> Format conversation history (dynamic last_k)
       [FMT]   -> Detect requested response format (table / comparison / paragraph)
-
-    [CTX] Context budget logic:
-      1. Estimate tokens for retrieved chunks.
-      2. If chunks exceed CHUNK_TOKEN_BUDGET, truncate the combined text.
-      3. Estimate tokens for full history (last MEMORY_LAST_K exchanges).
-      4. If history + chunks together are too large, reduce history to 1 exchange.
-      5. If still over budget, drop history entirely.
-      This ensures the prompt never silently exceeds Mistral Small's 32k limit.
     """
-    # [FMT] Strip format-instruction words ("table", "compare", "vs", ...)
-    # before retrieval. These words describe HOW to present the answer, not
-    # WHAT the answer is about, and literally matching them via BM25 can
-    # pull in unrelated pages (e.g. "table" matching a "TABLE OF CONTENTS"
-    # page). detect_response_format() below still sees the ORIGINAL
-    # question, so the requested format is never lost — only the text used
-    # for search is cleaned.
+    # [FMT] Strip format-instruction words before retrieval — see
+    # _strip_format_keywords docstring for the concrete bug this avoids.
     retrieval_question = _strip_format_keywords(user_question)
 
-    # [FIX] Round 6: detect comprehensive intent BEFORE rewriting, so we can
-    # make the rewrite deterministic for these requests (see rewrite_query
-    # docstring) — completeness matters more than wording diversity here.
-    comprehensive = _wants_comprehensive_listing(user_question)
-    rewrite_temperature = 0.0 if comprehensive else 0.1
+    # [FIX] Round 7.2: tiered intent detection — see _wants_full_section_expansion
+    # / _wants_broader_recall docstrings. Computed once, reused for the rewrite
+    # temperature and the retrieval-width decisions below.
+    full_expansion = _wants_full_section_expansion(user_question)
+    broader_recall = full_expansion or _wants_broader_recall(user_question)
+    rewrite_temperature = 0.0 if broader_recall else 0.1
 
-    # #3: Rewrite query for better retrieval (domain-aware)
     search_query = rewrite_query(
         retrieval_question, document_type=document_type, temperature=rewrite_temperature
     )
+    logger.debug(
+        "Question=%r Rewritten=%r FullExpansion=%s BroaderRecall=%s",
+        user_question, search_query, full_expansion, broader_recall,
+    )
 
-    # [FIX] Round 4: widen retrieval + chunk budget for comprehensive/listing
-    # requests (full tables, comparisons, "all of X") — see
-    # _wants_comprehensive_listing() and COMPREHENSIVE_TOP_K_CHUNKS above.
-    retrieval_k = COMPREHENSIVE_TOP_K_CHUNKS if comprehensive else None
-    chunk_budget = CHUNK_TOKEN_BUDGET_COMPREHENSIVE if comprehensive else CHUNK_TOKEN_BUDGET
+    # [FIX] Round 7.5: dropped the MODERATE_TOP_K_CHUNKS boost for the
+    # broader_recall-but-not-full_expansion tier. Bug: widening k to 20 for
+    # generic completeness wording ("all", "every") genuinely matched pages
+    # scattered across most of a procedural manual (every section uses
+    # similar step-by-step phrasing), turning a 2-page answer into nearly
+    # half the document. The default top-k is already enough to surface
+    # genuinely relevant chunks for a reasonably specific question; the
+    # top-N-scoped page padding (see _pad_adjacent_pages) and the recall
+    # fallback below remain as universal safety nets regardless of this
+    # tier, so completeness for a real multi-page SECTION (not a sprawling
+    # match across unrelated sections) is still covered without needing a
+    # wider net here.
+    if full_expansion:
+        retrieval_k, chunk_budget = COMPREHENSIVE_TOP_K_CHUNKS, CHUNK_TOKEN_BUDGET_COMPREHENSIVE
+    else:
+        retrieval_k, chunk_budget = None, CHUNK_TOKEN_BUDGET
 
-    # #1 + #5 + #4: Hybrid retrieval with source pages
-    pdf_content, source_pages = retrieve_with_sources(retriever, search_query, k_override=retrieval_k)
+    # [FIX] Round 7: never settle for a single thin retrieval pass — escalate
+    # automatically before ever telling the model (and the user) "not found".
+    pdf_content, source_pages = _retrieve_with_recall_fallback(
+        retriever, search_query, user_question,
+        base_k_override=retrieval_k, base_expand_sections=full_expansion,
+    )
 
     # ── [CTX] Step 1: Cap chunk tokens ────────────────────────────────────────
     chunk_tokens = estimate_token_count(pdf_content)
     if chunk_tokens > chunk_budget:
         max_chunk_chars = chunk_budget * 4
         pdf_content = pdf_content[:max_chunk_chars]
-        print(f"[CTX] Chunks trimmed: {chunk_tokens} → {chunk_budget} tokens")
+        logger.debug("Chunks trimmed: %d -> %d tokens", chunk_tokens, chunk_budget)
 
     # ── [CTX] Step 2: Dynamic history trim ────────────────────────────────────
     history_list = chat_history or []
@@ -999,7 +1525,10 @@ def _prepare_pipeline_inputs(
 
     chunk_tok   = estimate_token_count(pdf_content)
     history_tok = estimate_token_count(full_history_text)
-    system_tok  = 600   # rough estimate for system + human prompt scaffolding
+    # [FIX] Round 7.9: 2000 -> 2200. The system + human prompt scaffolding
+    # now measures ~2,140 tokens after the paired-variant (Open Circuit/
+    # Shorted style) extraction-order guidance was folded in.
+    system_tok  = 2200
 
     total_estimated = chunk_tok + history_tok + system_tok
 
@@ -1007,10 +1536,10 @@ def _prepare_pipeline_inputs(
         short_tok = estimate_token_count(short_history_text)
         if chunk_tok + short_tok + system_tok <= CONTEXT_TOKEN_BUDGET:
             effective_last_k = 1
-            print(f"[CTX] History trimmed to 1 exchange (budget: {total_estimated} > {CONTEXT_TOKEN_BUDGET})")
+            logger.debug("History trimmed to 1 exchange (budget %d > %d)", total_estimated, CONTEXT_TOKEN_BUDGET)
         else:
             effective_last_k = 0
-            print(f"[CTX] History dropped entirely (budget: {total_estimated} > {CONTEXT_TOKEN_BUDGET})")
+            logger.debug("History dropped entirely (budget %d > %d)", total_estimated, CONTEXT_TOKEN_BUDGET)
 
     history_text = format_chat_history(history_list, last_k=effective_last_k)
 
@@ -1026,6 +1555,12 @@ def _prepare_pipeline_inputs(
     return chain_inputs, source_pages
 
 
+# ── [CTX] Token estimation helper ────────────────────────────────────────────
+def estimate_token_count(text: str) -> int:
+    """Rough token estimator: 1 token ≈ 4 characters."""
+    return max(1, len(text) // 4)
+
+
 # ── STEP 7: Ask question (full smart pipeline, blocking) ──────────────────────
 def ask_question(
     chain,
@@ -1036,8 +1571,8 @@ def ask_question(
 ) -> tuple:
     """
     Step 7: Full smart pipeline (blocking). Builds chain inputs via
-    _prepare_pipeline_inputs(), invokes the chain once, and returns the
-    complete answer.
+    _prepare_pipeline_inputs(), invokes the chain once, parses the
+    structured JSON the model returned, and returns the rendered answer.
 
     Returns:
         (answer_string, [source_page_numbers])
@@ -1049,7 +1584,9 @@ def ask_question(
         retriever, user_question, chat_history, document_type
     )
 
-    answer = chain.invoke(chain_inputs)
+    raw_output = chain.invoke(chain_inputs)
+    parsed = _parse_json_answer(raw_output)
+    answer = _render_final_answer(parsed)
     return answer, source_pages
 
 
@@ -1063,17 +1600,32 @@ def ask_question_stream(
 ) -> tuple:
     """
     [STREAM] Streaming counterpart to ask_question(). Runs the same
-    retrieval + context-budget + format-detection pipeline up front
-    (fast — no LLM generation yet), then returns immediately with:
+    retrieval + context-budget + format-detection pipeline up front (fast —
+    no LLM generation yet), then returns immediately with:
 
         (source_pages, answer_chunk_generator)
 
     `source_pages` is already known at this point (retrieval has finished),
-    so the UI can display "Sources: Page X" right away. The caller should
-    iterate `answer_chunk_generator` to receive the answer text as it is
-    generated, chunk by chunk, instead of waiting for the full response —
-    this is what lets the UI show partial/in-progress output like a real
-    chat product, rather than a blank screen until everything is ready.
+    so the UI can display "Sources: Page X" right away.
+
+    [FIX] Round 7 — streaming design note: the generator below buffers the
+    full raw JSON response from chain.stream() internally before yielding
+    anything, then reveals the GUARANTEED-correct, fully-parsed final text
+    in small increments for a smooth "typing" animation, rather than
+    live-streaming raw partial JSON characters.
+
+    This was a deliberate choice, not an oversight: the UI consuming this
+    generator can only ever APPEND each yielded chunk to what it has
+    already shown (it has no way to retract or correct earlier text). Raw
+    JSON streamed mid-flight is frequently mid-escape-sequence, mid-Tag-
+    field, or about to be followed by closing `"}` syntax — any of which
+    would have to "leak" into the visible answer or be guessed at
+    approximately. A guess that's later proven wrong could no longer be
+    un-shown, and would permanently corrupt the stored chat history (it's
+    re-rendered from that accumulated text on every future page rerun).
+    Buffering costs nothing in practice — the API call itself still
+    streams under the hood, and total wall-clock time to a finished answer
+    is unchanged; only the in-between display behavior is different.
 
     Returns:
         (source_pages: list[int], generator yielding str chunks)
@@ -1088,20 +1640,29 @@ def ask_question_stream(
     )
 
     def _answer_generator():
-        for chunk in chain.stream(chain_inputs):
-            # StrOutputParser streams plain string deltas.
-            yield chunk
+        raw_chunks = []
+        for piece in chain.stream(chain_inputs):
+            raw_chunks.append(piece)
+        raw_output = "".join(raw_chunks)
+
+        parsed = _parse_json_answer(raw_output)
+        final_text = _render_final_answer(parsed)
+
+        # Reveal the already-final, validated text in small increments —
+        # purely a pacing/animation choice, not a guess about content that
+        # could later change (see design note above).
+        reveal_chunk_size = 24
+        for i in range(0, len(final_text), reveal_chunk_size):
+            yield final_text[i:i + reveal_chunk_size]
 
     return source_pages, _answer_generator()
 
 
 # ── CLI Entry Point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    pdf_path = sys.argv[1] if len(sys.argv) > 1 else "document.pdf"
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    # Optional: pass document type as second CLI arg
-    # e.g.  python pdf_chatbot.py report.pdf legal
-    #        python pdf_chatbot.py notes.pdf medical
+    pdf_path = sys.argv[1] if len(sys.argv) > 1 else "document.pdf"
     doc_type = sys.argv[2] if len(sys.argv) > 2 else "technical"
 
     result = load_pdf(pdf_path)
@@ -1114,7 +1675,8 @@ if __name__ == "__main__":
     cli_history = []
 
     print("=" * 55)
-    print(" PDF Chatbot ready! (v4 — Format-Aware + Streaming)")
+    print(" PDF Chatbot ready! (v7 — Structured JSON + Recall Fallback)")
+    print(f"   Model         : {MODEL}")
     print(f"   Document type : {doc_type}")
     print(f"   Max tokens    : {MAX_TOKENS}")
     print(f"   Context budget: {CONTEXT_TOKEN_BUDGET:,} tokens")
@@ -1132,7 +1694,6 @@ if __name__ == "__main__":
 
         cli_history.append({"role": "user", "content": user_input})
 
-        # CLI streams to stdout too, to exercise the same code path as the UI.
         source_pages, answer_gen = ask_question_stream(
             chain,
             pdf_store["retriever"],
