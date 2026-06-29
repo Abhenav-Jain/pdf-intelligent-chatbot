@@ -148,6 +148,9 @@ class EnsembleRetriever(BaseRetriever):
     # comprehensive request can pull in ALL chunks from a detected
     # multi-page section — not just whichever ones ranked in the top-k.
     all_chunks: list = Field(default_factory=list)
+    # [FIX] Round 7.20: {section_title: page_number}, extracted from the
+    # document's own Table of Contents — see _extract_toc_title_to_page_map.
+    toc_title_map: dict = Field(default_factory=dict)
 
     def _get_relevant_documents(self, query: str) -> list:
         all_docs = {}
@@ -182,8 +185,38 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 if not MISTRAL_API_KEY:
     raise ValueError("MISTRAL_API_KEY not found in .env file!")
 
-# Model kept exactly as configured — not changed in this round.
-MODEL         = "mistral-small-2506"
+# [FIX] Round 7.15: split the single MODEL constant into two — answer
+# quality matters far more than query-rewriting quality, so it's worth
+# spending the upgrade where it counts and keeping the cheap/fast model
+# where frontier reasoning isn't needed.
+#
+# ANSWER_MODEL: per Mistral's own pricing-page guidance ("For most tasks:
+# Mistral Large (best overall performance)" — mistral.ai/pricing, verified
+# June 2026), mistral-large-latest is both the highest-quality general-
+# purpose model AND, as of this writing, priced LOWER per token than
+# Medium 3.5 ($0.5/$1.5 per M tokens vs $1.5/$7.5) since it's the open-
+# weight tier. Used for the final answer generation, where every fix in
+# this file's changelog (table fidelity, completeness, topic-scoping) most
+# benefits from stronger instruction-following.
+#
+# REWRITE_MODEL: kept on the small/cheap tier — turning a question into a
+# better search query doesn't need frontier-level reasoning, so paying for
+# the bigger model here would mostly add cost and latency without
+# meaningfully improving retrieval quality.
+#
+# Both use the "-latest" alias rather than a pinned dated snapshot, so the
+# code automatically benefits from Mistral's rolling model updates.
+#
+# Free-tier note: Mistral's API (La Plateforme) free/experiment tier is
+# rate-limited but, per Mistral's own documentation and multiple
+# third-party trackers as of June 2026, is NOT restricted to specific
+# models — it covers the full lineup including Large. Exact rate limits
+# are account-specific and can change; check https://console.mistral.ai
+# (Admin -> Limits) if you hit 429 errors, and fall back to
+# "mistral-small-latest" for ANSWER_MODEL too if your account's free-tier
+# quota doesn't comfortably cover Large at your usage volume.
+ANSWER_MODEL  = "mistral-large-latest"
+REWRITE_MODEL = "mistral-small-latest"
 CHAR_LIMIT    = 200_000
 
 # Chunking / retrieval tuning (unchanged from the current configuration)
@@ -201,23 +234,33 @@ MEMORY_LAST_K = 3
 # fit comfortably before was getting cut off mid-table (and mid-word) at
 # the old limit once wrapped in JSON — the model ran out of output budget
 # partway through, silently dropping every row after the cutoff.
-MAX_TOKENS    = 6144
+# [FIX] Round 7.15: 6144 -> 8000. Modest further increase now that the
+# answer model changed (see ANSWER_MODEL) — a bit more headroom costs
+# little and further reduces any residual truncation risk on long tables.
+MAX_TOKENS    = 8_000
 
-# Mistral Small context window = 32,768 tokens. Reserve 24,000 for input
-# (system + history + chunks + instructions), leaving ~6,000+ for output
-# (MAX_TOKENS=6144) plus a safety buffer — still comfortably under 32,768
-# combined even in the worst case (24,000 + 6,144 = 30,144).
-CONTEXT_TOKEN_BUDGET = 24_000
+# [FIX] Round 7.15: these budgets were originally sized for Mistral
+# Small's 32,768-token context window. mistral-large-latest is widely
+# reported (multiple independent sources, June 2026) to support a 128K
+# context window — a meaningful jump. Raised these substantially but NOT
+# all the way to the 128K ceiling, leaving a deliberate margin in case
+# that figure is imprecise for this exact model/account: 80,000 (input)
+# + 8,000 (output, MAX_TOKENS above) = 88,000, comfortably under even a
+# conservative 100K estimate, with ~40K of slack remaining either way.
+# If you see a 400 "context window exceeded" error, the most likely fix
+# is lowering CONTEXT_TOKEN_BUDGET below — check the model's actual
+# documented limit at https://docs.mistral.ai/models/overview first.
+CONTEXT_TOKEN_BUDGET = 80_000
 
 # Max tokens consumed by retrieved PDF chunks in the prompt for a normal
 # (non-comprehensive) question.
-CHUNK_TOKEN_BUDGET   = 8_000
+CHUNK_TOKEN_BUDGET   = 16_000
 
 # [FIX] Round 4: comprehensive/listing requests (full tables, comparisons,
 # "all of X") need a much wider retrieval net — a handful of top-ranked
 # chunks covers one fact, not a table spanning several pages.
 COMPREHENSIVE_TOP_K_CHUNKS       = 50
-CHUNK_TOKEN_BUDGET_COMPREHENSIVE = 18_000
+CHUNK_TOKEN_BUDGET_COMPREHENSIVE = 40_000
 
 # [DEPRECATED] Round 7.2 introduced this as a middle tier for generic
 # completeness wording ("all", "every"). Round 7.5 removed its usage —
@@ -407,6 +450,79 @@ def _is_toc_like_chunk(text: str) -> bool:
     return (toc_like / len(lines)) >= 0.5
 
 
+_TOC_LINE_RE = re.compile(r"^(.+?)[.\s]{2,}(\d{1,4})\s*$")
+_TOC_LEADING_NUM_RE = re.compile(r"^\d+(-\d+)*\.?\s*")
+
+
+def _extract_toc_title_to_page_map(pages: list) -> dict:
+    """
+    [FIX] Round 7.20: every "Title .......... 42" line in the document is
+    already being scanned by _is_toc_like_chunk() to decide what to
+    EXCLUDE from the retrievable index — but that structure (which titles
+    exist, and which page they start on) is genuinely useful information
+    that was previously thrown away entirely along with the noise.
+
+    This extracts a {normalized_title: page_number} map from those same
+    lines before the TOC content is discarded. It's used as a direct,
+    deterministic anchor when a question closely matches a known section
+    title (see _find_matching_toc_title), sidestepping the keyword/semantic
+    ambiguity that has repeatedly caused retrieval to anchor on the wrong
+    section for exactly this kind of query:
+      - "re-energize after a power failure" anchored on Error Codes
+        instead of Start-up (both repeat "turn switch OFF then back ON").
+      - "give me the basic operations" anchored on Filter Control /
+        Troubleshooting instead of Basic Operation.
+      - "give me control overview" anchored on a sprawl of Lid Operation /
+        Start-up / Oil Tank / Condensation Tank / Filtering — none of
+        which is the actual Control Overview (button/display) content —
+        spanning enough distance that even the anchor-locality ceiling
+        didn't catch it, because the anchor itself was already wrong.
+    All three share the same root cause: generic procedural vocabulary
+    ("turn switch", "press the button", "the control") repeats throughout
+    a technical manual, so rank-based retrieval alone can't reliably tell
+    "this section" from "a different section that happens to use similar
+    words." The document's OWN table of contents already disambiguates
+    this perfectly — it's the one place section titles are unambiguous.
+    """
+    title_map = {}
+    for page_data in pages:
+        for line in page_data["text"].split("\n"):
+            match = _TOC_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            title = _TOC_LEADING_NUM_RE.sub("", match.group(1)).strip()
+            try:
+                page_num = int(match.group(2))
+            except ValueError:
+                continue
+            if 2 <= len(title) <= 60:
+                title_map[title.lower()] = page_num
+    return title_map
+
+
+def _find_matching_toc_title(question: str, title_map: dict, min_overlap: float = 0.7) -> int:
+    """
+    [FIX] Round 7.20: fuzzy-matches the question against known section
+    titles (see _extract_toc_title_to_page_map) using simple word overlap
+    — deliberately conservative (most of a title's own words must appear
+    in the question) so this only fires for genuine "give me section X"
+    style questions, not for general questions that happen to share a
+    word or two with some title. Returns the matched page number, or None.
+    """
+    if not title_map:
+        return None
+    q_words = set(re.findall(r"[a-z0-9]+", question.lower()))
+    best_page, best_score = None, 0.0
+    for title, page in title_map.items():
+        t_words = set(re.findall(r"[a-z0-9]+", title))
+        if not t_words:
+            continue
+        overlap = len(q_words & t_words) / len(t_words)
+        if overlap > best_score:
+            best_score, best_page = overlap, page
+    return best_page if best_score >= min_overlap else None
+
+
 def _pages_to_chunks(pages: list) -> tuple:
     """
     Splits page texts into overlapping chunks.
@@ -471,6 +587,10 @@ def build_hybrid_retriever(pages: list):
         # [FIX] Round 5: keep every (text, page) pair around so a
         # comprehensive request can later expand to a full page range.
         all_chunks=list(zip(chunk_texts, (m["page"] for m in chunk_metas))),
+        # [FIX] Round 7.20: title -> page map from the document's own TOC,
+        # used to directly anchor "give me section X" style questions
+        # instead of relying solely on keyword/semantic ranking.
+        toc_title_map=_extract_toc_title_to_page_map(pages),
     )
 
     return hybrid_retriever
@@ -598,7 +718,7 @@ def rewrite_query(
     place. Pronoun/ellipsis resolution has to happen before retrieval, not
     just before generation.
     """
-    llm = _get_llm(MODEL, temperature, max_tokens=600)
+    llm = _get_llm(REWRITE_MODEL, temperature, max_tokens=600)
 
     history_block = ""
     if recent_context:
@@ -873,7 +993,8 @@ def _expand_to_full_section(retriever, retrieved_docs: list) -> list:
 
 
 def retrieve_with_sources(
-    retriever, question: str, k_override: int = None, expand_sections: bool = False
+    retriever, question: str, k_override: int = None, expand_sections: bool = False,
+    raw_question_for_anchor: str = None,
 ) -> tuple:
     """
     #4: Retrieves relevant chunks and extracts source page numbers.
@@ -895,12 +1016,28 @@ def retrieve_with_sources(
         missed by ranking alone, once a genuine multi-page section is
         detected (an unbounded range, unlike the padding above).
 
+    [FIX] Round 7.20: before falling back to the rank-based top hit as the
+    anchor, checks whether `raw_question_for_anchor` (the user's actual
+    raw question — pass this explicitly, since `question` here is often
+    already the rewritten/cleaned search query, and matching should
+    happen against what the user actually typed) closely matches a known
+    section title from the document's own Table of Contents (see
+    _find_matching_toc_title). If so, that title's page becomes the
+    anchor directly, and its chunks are injected so they survive the
+    cutoff/filtering below regardless of how they happened to rank. This
+    closes a recurring failure mode where generic procedural vocabulary
+    ("turn switch", "press the button") made keyword/semantic ranking
+    anchor on a completely unrelated section sharing that vocabulary —
+    rank-based anchoring can't fix this because the anchor itself was
+    already wrong; the document's own TOC disambiguates it directly.
+
     When expand_sections=False (normal questions): after padding,
     _restrict_to_anchor_locality() drops anything farther than
-    MAX_PAGE_DISTANCE_FROM_ANCHOR pages from the single highest-ranked
-    original hit — a structural ceiling, not a rank-based one, that
-    closes the gap rank-based filtering alone couldn't (see that
-    function's docstring for the concrete bug this fixes).
+    MAX_PAGE_DISTANCE_FROM_ANCHOR pages from the anchor (TOC-confirmed if
+    available, otherwise the single highest-ranked original hit) — a
+    structural ceiling, not a rank-based one, that closes the gap
+    rank-based filtering alone couldn't (see that function's docstring
+    for the concrete bug this fixes).
 
     Chunks are always sorted by page number before being joined into
     context — reading in document order (rather than relevance-rank
@@ -918,7 +1055,26 @@ def retrieve_with_sources(
     restores = _boost_retriever_k(retriever, k_override) if k_override else []
     try:
         docs = retriever.invoke(question)
-        anchor_page = docs[0].metadata.get("page") if docs else None
+
+        toc_map = getattr(retriever, "toc_title_map", None)
+        anchor_text = raw_question_for_anchor if raw_question_for_anchor is not None else question
+        toc_anchor_page = _find_matching_toc_title(anchor_text, toc_map) if toc_map else None
+
+        if toc_anchor_page is not None:
+            anchor_page = toc_anchor_page
+            already_have = {d.page_content for d in docs}
+            all_chunks = getattr(retriever, "all_chunks", None) or []
+            injected = [
+                _SimpleDoc(text, page) for text, page in all_chunks
+                if page == toc_anchor_page and text not in already_have
+            ]
+            docs = injected + docs
+            logger.debug(
+                "TOC title match for %r -> anchoring on page %s (%d chunks injected)",
+                anchor_text, toc_anchor_page, len(injected),
+            )
+        else:
+            anchor_page = docs[0].metadata.get("page") if docs else None
 
         if not expand_sections:
             # [FIX] Round 7.5: cap to genuinely top-ranked chunks for normal
@@ -1000,7 +1156,8 @@ def _retrieve_with_recall_fallback(
     attempts = []
 
     pdf_content, source_pages = retrieve_with_sources(
-        retriever, search_query, k_override=base_k_override, expand_sections=base_expand_sections
+        retriever, search_query, k_override=base_k_override, expand_sections=base_expand_sections,
+        raw_question_for_anchor=raw_question,
     )
     attempts.append((pdf_content, source_pages))
     if source_pages and len(pdf_content.strip()) >= MIN_USEFUL_RETRIEVAL_CHARS:
@@ -1011,7 +1168,8 @@ def _retrieve_with_recall_fallback(
         len(source_pages), len(pdf_content), search_query,
     )
     pdf_content, source_pages = retrieve_with_sources(
-        retriever, search_query, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=base_expand_sections
+        retriever, search_query, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=base_expand_sections,
+        raw_question_for_anchor=raw_question,
     )
     attempts.append((pdf_content, source_pages))
     if source_pages and len(pdf_content.strip()) >= MIN_USEFUL_RETRIEVAL_CHARS:
@@ -1020,7 +1178,8 @@ def _retrieve_with_recall_fallback(
     if raw_question.strip().lower() != search_query.strip().lower():
         logger.debug("Still thin — retrying with the raw, un-rewritten question")
         pdf_content, source_pages = retrieve_with_sources(
-            retriever, raw_question, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=base_expand_sections
+            retriever, raw_question, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=base_expand_sections,
+            raw_question_for_anchor=raw_question,
         )
         attempts.append((pdf_content, source_pages))
         if source_pages and len(pdf_content.strip()) >= MIN_USEFUL_RETRIEVAL_CHARS:
@@ -1297,9 +1456,15 @@ def build_langchain_prompt() -> ChatPromptTemplate:
         "Basic Operation) because they happened to share some wording with the "
         "question — when that happens, address ONLY the section(s) the "
         "question is actually about and ignore the rest entirely, even though "
-        "real content is available for them. Answer only the topic actually "
-        "asked about, and never repeat the same heading, list, or paragraph more "
-        "than once within a single Response. "
+        "real content is available for them. This includes a section that "
+        "immediately follows the one asked about with its own distinct title "
+        "(e.g. context for a \"Control Overview\" question also containing the "
+        "next section, \"Display Options\"; or a \"Basic Operation\" question "
+        "also containing the next section, \"Care of the Oil\") — being "
+        "adjacent or about a related component does NOT make it part of the "
+        "answer; only include it if the question is actually about it. Answer "
+        "only the topic actually asked about, and never repeat the same "
+        "heading, list, or paragraph more than once within a single Response. "
 
         "NUMBERING: when the source presents a sequence of ordered steps where "
         "doing them in order matters, reproduce them as ONE numbered Markdown "
@@ -1310,13 +1475,33 @@ def build_langchain_prompt() -> ChatPromptTemplate:
         "possibly marked \"(CONT.)\", begins at step 8) — when that happens, "
         "treat them as ONE continuous procedure and continue the numbering "
         "from the source's own step numbers; never restart a later portion at "
-        "1 or present it as a separate \"Additional Steps\" list. Use bullet "
-        "points only for items that have no inherent order. "
+        "1 or present it as a separate \"Additional Steps\" list. Do NOT "
+        "reorganize one flat numbered procedure into multiple THEMATIC "
+        "sub-groups that each restart at \"1.\" (e.g. splitting a single "
+        "1-10 step procedure into \"1. Initial Start-Up\", \"1. Loading the "
+        "Product\", \"1. Completing the Cycle\" with bullets under each) — "
+        "this discards the source's actual step numbers even though no "
+        "individual list ever reached step 2 before resetting. If you want "
+        "to group related steps for readability, use a short descriptive "
+        "phrase or bold lead-in instead of a numbered marker, and keep ALL "
+        "the steps in ONE continuously-numbered list using their true "
+        "source numbers throughout. Use bullet points only for items that "
+        "have no inherent order. "
 
-        "TABLE COLUMN FIDELITY: when the source is laid out as parallel columns "
-        "(for example a Display/Cause/Correction error table), preserve that "
-        "structure as a Markdown table by default, even without an explicit "
-        "request for a table. Identify EVERY distinct column before writing any "
+        "TABLE COLUMN FIDELITY: this applies to ANY source laid out as parallel "
+        "columns, not just error tables — e.g. a Fig./Item No./Description/"
+        "Function table for a control board's buttons, a Display/Cause/"
+        "Correction error table, or any other multi-column listing. Preserve "
+        "that structure as a Markdown table by default, even without an "
+        "explicit request for a table — do NOT convert it into a numbered "
+        "prose list just because each row also happens to read like a short "
+        "paragraph. A numbered list that mixes top-level items with nested "
+        "sub-bullets (e.g. one item has 3 bullet points under it) is "
+        "especially prone to a real rendering bug: the numbering restarts at "
+        "1 after the nested bullets instead of continuing — a table's rows "
+        "have no shared counter to break, so preferring a table over a "
+        "numbered list also avoids this failure mode entirely. "
+        "Identify EVERY distinct column before writing any "
         "row, and map each value to the SAME column it came from — never shift "
         "values over by one column, merge two columns into one, or drop a "
         "column's content (most often the longest one, e.g. the correction/"
@@ -1338,6 +1523,14 @@ def build_langchain_prompt() -> ChatPromptTemplate:
         "its code, only a Correction), still write that row with the SAME "
         "column count, putting a placeholder like \"Not specified\" in the "
         "empty cell rather than skipping it. "
+        "ONE ROW PER LINE: every table row must end with a newline before "
+        "the next row begins — never write two or more rows back-to-back on "
+        "the same line (e.g. never produce \"...(Page 19) | | 3-4 | 5 | "
+        "...\" with just a bare \"| |\" separating two rows instead of a "
+        "line break). A table with rows squished together like this fails "
+        "to render as a table at all and shows up as raw, broken text to "
+        "the user — verify each row you write is followed by an actual line "
+        "break before starting the next one. "
         "PAIRED VARIANTS: when two adjacent rows are clearly two variants of "
         "the same underlying issue (e.g. one row says \"(Open Circuit)\" and "
         "the very next says \"(Shorted)\" for the same component, or similar "
@@ -1533,7 +1726,8 @@ def _prepare_escalated_retry_inputs(
     paid only when the first pass actually needed it.
     """
     pdf_content, source_pages = retrieve_with_sources(
-        retriever, user_question, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=True
+        retriever, user_question, k_override=COMPREHENSIVE_TOP_K_CHUNKS, expand_sections=True,
+        raw_question_for_anchor=user_question,
     )
     chunk_budget = CHUNK_TOKEN_BUDGET_COMPREHENSIVE
     chunk_tokens = estimate_token_count(pdf_content)
@@ -1549,6 +1743,197 @@ def _prepare_escalated_retry_inputs(
     return chain_inputs, source_pages
 
 
+# ── [FIX] Round 7.16: completeness — detect truncation by token budget ────────
+TRUNCATION_RETRY_MAX_TOKENS = MAX_TOKENS * 2
+
+
+def _looks_truncated_by_token_limit(raw_output: str, max_tokens: int, threshold: float = 0.92) -> bool:
+    """
+    [FIX] Round 7.16: True when the RAW model output's estimated token
+    count is suspiciously close to the configured max_tokens ceiling — a
+    reliable, code-verifiable signal that generation was cut off mid-answer
+    rather than finishing naturally, instead of guessing from text
+    patterns (a truncated sentence/table-row can end in all sorts of
+    characters, so pattern-matching the text itself is unreliable; the
+    token count hitting the ceiling is not). A naturally-completing answer
+    almost always has some slack before the limit — using 92%+ of the
+    budget is a strong sign the model wanted to keep going and couldn't.
+
+    Concrete motivation: even after raising MAX_TOKENS several times across
+    earlier rounds (3072 -> 6144 -> 8000) to fix specific observed
+    truncations, there's no actual guarantee a long enough table/section
+    won't eventually hit whatever the current ceiling is. Detecting it
+    directly, rather than only reactively raising the constant again after
+    every report, closes that class of bug generally.
+    """
+    return estimate_token_count(raw_output) >= max_tokens * threshold
+
+
+def _build_answer_chain(max_tokens: int):
+    """
+    [FIX] Round 7.16: builds a prompt|llm|parser chain with a specific
+    max_tokens, reusing the cached LLM client (see _get_llm) for that
+    exact value. Used to retry with a larger budget after
+    _looks_truncated_by_token_limit() fires — the SAME retrieved content is
+    reused (only the output ceiling changes), since the problem was never
+    what was retrieved, only how much room the model had to write it out.
+    """
+    llm = _get_llm(ANSWER_MODEL, temperature=0, max_tokens=max_tokens, json_mode=True)
+    prompt = build_langchain_prompt()
+    parser = StrOutputParser()
+    return prompt | llm | parser
+
+
+# ── [FIX] Round 7.16: sequencing — detect a numbered list that restarted ──────
+_NUMBERING_CORRECTION_NOTE = (
+    "CORRECTION NEEDED: your previous attempt at this answer restarted a "
+    "numbered list back at 1 partway through what should have been one "
+    "continuous sequence (most often right after a nested bullet sub-list "
+    "broke the flow). This time, when continuing a numbered list after any "
+    "nested bullets or sub-items, continue counting from where you left off "
+    "(e.g. ...3, 4, 5...) — never restart at 1 unless you are beginning a "
+    "genuinely new, separately-headed list. If the source content is "
+    "naturally tabular (parallel columns), consider presenting it as a "
+    "Markdown table instead, which has no shared counter to break in the "
+    "first place."
+)
+
+
+def _has_broken_numbering(text: str) -> bool:
+    """
+    [FIX] Round 7.16: detects the "numbering restarts at 1 mid-list" bug
+    found in testing — e.g. a Control Overview answer went 1 (Buttons),
+    2 (Menu Button), 3 (Info Button, with 3 nested sub-bullets underneath
+    it), then incorrectly restarted at 1 (Arrow Displays) instead of
+    continuing at 4.
+
+    [FIX] Round 7.19: generalized to also catch a related but distinct
+    pattern found later — "give me basic operations" reorganized one flat
+    10-step procedure into 5 THEMATIC groups ("Initial Start-Up",
+    "Loading and Cooking Product", "Completing the Cook Cycle", ...), each
+    one headed by a literal "1." used as a pseudo-heading with its own
+    bullet sub-items underneath. The original detector missed this
+    entirely: it only flagged a restart-to-1 after the count had reached
+    2 or higher, but here the count never leaves 1 in the first place — it
+    just repeats "1." as a section marker 5 times in a row. Both patterns
+    share the same real problem (the source's true step numbers, 1
+    through 10, were discarded), so the detection is now unified: ANY
+    top-level "1." that is not the very FIRST top-level numbered marker
+    encountered, with no Markdown heading (##, ###, etc.) appearing
+    in between, is flagged — covering "2, 3 -> 1" and "1 -> 1 -> 1"
+    alike. A heading in between is still treated as evidence of a
+    genuinely new, separate list/section, which is legitimate.
+    """
+    seen_first_top_level = False
+    saw_heading_since_last_num = False
+    for line in text.split("\n"):
+        if re.match(r"^#{1,6}\s", line):
+            saw_heading_since_last_num = True
+            continue
+        match = re.match(r"^\s*(\d+)\.\s", line)
+        if not match:
+            continue
+        n = int(match.group(1))
+        if n == 1 and seen_first_top_level and not saw_heading_since_last_num:
+            return True
+        seen_first_top_level = True
+        saw_heading_since_last_num = False
+    return False
+
+
+def _generate_with_self_correction(
+    invoke_fn, chain_inputs: dict, source_pages: list, retriever, user_question: str, document_type: str
+) -> tuple:
+    """
+    [FIX] Round 7.16: shared self-correction pipeline used by both
+    ask_question (blocking) and ask_question_stream. Runs the first
+    generation pass, then applies up to three independent, single-shot
+    retries if needed — each bounded to one extra attempt, so the worst
+    case (all three problems at once) is 4 total generation calls, which
+    is rare in practice and still a small, predictable ceiling:
+
+      1. TRUNCATION retry — if the first pass's raw output hit the token
+         ceiling (_looks_truncated_by_token_limit), regenerate with the
+         SAME retrieved content but a doubled output budget
+         (TRUNCATION_RETRY_MAX_TOKENS). The problem was never what was
+         retrieved, only how much room the model had to write it out.
+      2. NUMBERING retry — if a numbered list incorrectly restarted at 1
+         (_has_broken_numbering), regenerate with the SAME retrieved
+         content plus an explicit correction note appended to
+         format_instruction (_NUMBERING_CORRECTION_NOTE).
+      3. NOT-FOUND retry — if the (possibly already-corrected) answer
+         still reads like a retrieval miss (_looks_like_not_found),
+         escalate to wider, rewriting-bypassing retrieval
+         (_prepare_escalated_retry_inputs) — this is the only one of the
+         three that can change source_pages, since it's the only one that
+         re-retrieves.
+
+    invoke_fn: callable taking a chain_inputs dict and returning the raw
+    string output — chain.invoke for blocking, or a small wrapper that
+    joins chain.stream() for streaming, so this logic is shared by both
+    call sites without either one needing to know about the other's
+    invocation style.
+
+    Returns (parsed: dict, source_pages: list[int]).
+    """
+    current_invoke = invoke_fn  # tracks the highest budget level reached so far
+
+    raw_output = invoke_fn(chain_inputs)
+
+    if _looks_truncated_by_token_limit(raw_output, MAX_TOKENS):
+        logger.debug("Output looked truncated at MAX_TOKENS — retrying with a larger budget")
+        retry_chain = _build_answer_chain(TRUNCATION_RETRY_MAX_TOKENS)
+        retry_raw = retry_chain.invoke(chain_inputs)
+        # [FIX] Round 7.17: ALWAYS prefer the larger-budget attempt once we've
+        # gone to the trouble of fetching it, even if it's STILL truncated —
+        # the previous version only swapped in the retry if it fully solved
+        # the truncation, which meant a still-too-long answer at the bigger
+        # budget (which has strictly MORE content than the original, same
+        # temperature=0 generation) was being silently discarded in favor of
+        # the original's MORE-truncated, LESS-complete output. A defensive
+        # length check guards against the rare case of a shorter retry.
+        if len(retry_raw) >= len(raw_output):
+            raw_output = retry_raw
+            # Carry the bigger budget forward: if a later check below also
+            # needs to regenerate, re-truncating at the SMALL budget would
+            # undo the fix we just paid for.
+            current_invoke = retry_chain.invoke
+
+    parsed = _parse_json_answer(raw_output)
+
+    if _has_broken_numbering(parsed.get("response", "")):
+        logger.debug("Detected a restarted numbered list — retrying with a correction note")
+        numbering_inputs = {
+            **chain_inputs,
+            "format_instruction": (
+                (chain_inputs.get("format_instruction") or "") + "\n\n" + _NUMBERING_CORRECTION_NOTE
+            ),
+        }
+        retry_raw = current_invoke(numbering_inputs)
+        retry_parsed = _parse_json_answer(retry_raw)
+        if not _has_broken_numbering(retry_parsed.get("response", "")):
+            parsed = retry_parsed
+
+    if _looks_like_not_found(parsed):
+        logger.debug("Answer looked like a retrieval miss — retrying with escalated retrieval")
+        retry_inputs, retry_pages = _prepare_escalated_retry_inputs(
+            retriever, user_question, document_type
+        )
+        # Reuses current_invoke (the same budget level already settled on
+        # above) rather than unconditionally building a fresh chain here —
+        # consistent with the numbering retry, and avoids constructing an
+        # extra LLM client in the common case where truncation never
+        # triggered. If this escalated-retrieval retry's own output then
+        # happens to need more room, that's an accepted, lower-priority
+        # edge case rather than a third independent budget-escalation path.
+        retry_raw = current_invoke(retry_inputs)
+        retry_parsed = _parse_json_answer(retry_raw)
+        if not _looks_like_not_found(retry_parsed):
+            parsed, source_pages = retry_parsed, retry_pages
+
+    return parsed, source_pages
+
+
 # ── STEP 6: Build chain ───────────────────────────────────────────────────────
 def build_chain():
     """
@@ -1561,13 +1946,13 @@ def build_chain():
     _get_llm) so the API itself enforces syntactically valid JSON, on top
     of the prompt instructions and the tolerant parser fallback.
 
+    [FIX] Round 7.16: now a thin wrapper over _build_answer_chain(), shared
+    with the truncation-retry path so both stay in sync.
+
     [STREAM] This same chain supports both .invoke() (blocking, used by
     ask_question) and .stream() (used by ask_question_stream).
     """
-    llm = _get_llm(MODEL, temperature=0, max_tokens=MAX_TOKENS, json_mode=True)
-    prompt = build_langchain_prompt()
-    parser = StrOutputParser()
-    return prompt | llm | parser
+    return _build_answer_chain(MAX_TOKENS)
 
 
 # ── #2: Memory helpers ────────────────────────────────────────────────────────
@@ -1689,7 +2074,10 @@ def _prepare_pipeline_inputs(
     # [FIX] Round 7.9: 2000 -> 2200. The system + human prompt scaffolding
     # now measures ~2,140 tokens after the paired-variant (Open Circuit/
     # Shorted style) extraction-order guidance was folded in.
-    system_tok  = 2200
+    # [FIX] Round 7.21: 2600 -> 2750. The system + human prompt scaffolding
+    # now measures ~2,670 tokens after the ONE ROW PER LINE table
+    # instruction was folded in.
+    system_tok  = 2750
 
     total_estimated = chunk_tok + history_tok + system_tok
 
@@ -1735,11 +2123,18 @@ def ask_question(
     _prepare_pipeline_inputs(), invokes the chain once, parses the
     structured JSON the model returned, and returns the rendered answer.
 
-    [FIX] Round 7.11: if the first pass's answer looks like a retrieval
-    miss (see _looks_like_not_found), automatically retries once with
-    escalated, rewriting-bypassing retrieval settings (see
-    _prepare_escalated_retry_inputs) before giving up — see that
-    function's docstring for the concrete bug this fixes.
+    [FIX] Round 7.16: now delegates to _generate_with_self_correction(),
+    shared with ask_question_stream — see that function's docstring for
+    the layered truncation/numbering/not-found retry logic.
+
+    [FIX] Round 7.17: the whole pipeline is wrapped in a top-level
+    try/except. A live demo is the worst possible moment for an
+    unhandled exception (a rate-limit error, a transient network blip, an
+    unexpected API response shape) to surface as a raw traceback in the
+    UI — every previous round's reliability work is wasted if a single
+    network hiccup crashes the app instead of just failing one answer.
+    This is a deliberately broad except: the goal here is "never crash,"
+    not "diagnose the failure" (that's what the debug log is for).
 
     Returns:
         (answer_string, [source_page_numbers])
@@ -1747,24 +2142,25 @@ def ask_question(
     if retriever is None:
         return "Please load a PDF first.", []
 
-    chain_inputs, source_pages = _prepare_pipeline_inputs(
-        retriever, user_question, chat_history, document_type
-    )
-
-    raw_output = chain.invoke(chain_inputs)
-    parsed = _parse_json_answer(raw_output)
-
-    if _looks_like_not_found(parsed):
-        retry_inputs, retry_pages = _prepare_escalated_retry_inputs(
-            retriever, user_question, document_type
+    try:
+        chain_inputs, source_pages = _prepare_pipeline_inputs(
+            retriever, user_question, chat_history, document_type
         )
-        retry_raw = chain.invoke(retry_inputs)
-        retry_parsed = _parse_json_answer(retry_raw)
-        if not _looks_like_not_found(retry_parsed):
-            parsed, source_pages = retry_parsed, retry_pages
 
-    answer = _render_final_answer(parsed)
-    return answer, source_pages
+        parsed, source_pages = _generate_with_self_correction(
+            chain.invoke, chain_inputs, source_pages, retriever, user_question, document_type
+        )
+
+        answer = _render_final_answer(parsed)
+        return answer, source_pages
+    except Exception:
+        logger.debug("ask_question failed unexpectedly", exc_info=True)
+        return (
+            "Something went wrong while generating this answer (a temporary "
+            "API or network issue). Please try asking again — if it keeps "
+            "happening, try rephrasing the question.",
+            [],
+        )
 
 
 # ── STEP 7 (STREAMING): Ask question with live partial output ─────────────────
@@ -1777,8 +2173,10 @@ def ask_question_stream(
 ) -> tuple:
     """
     [STREAM] Streaming counterpart to ask_question(). Runs retrieval,
-    generation, and (if needed) the Round 7.11 retry-on-not-found pass
-    before returning:
+    generation, and (if needed) the self-correction retries — see
+    _generate_with_self_correction() for the truncation / numbering /
+    not-found logic, shared with the blocking ask_question() path — before
+    returning:
 
         (source_pages, answer_chunk_generator)
 
@@ -1805,7 +2203,16 @@ def ask_question_stream(
     re-rendered from that accumulated text on every future page rerun).
     Buffering costs nothing in practice — the API call itself still
     streams under the hood, and total wall-clock time to a finished answer
-    is unchanged; only the in-between display behavior is different.
+    is unchanged; only the in-between display behavior is different. All
+    of this applies equally to the (possibly multiple) self-correction
+    retry calls — none of them are revealed to the user until the final
+    one is chosen.
+
+    [FIX] Round 7.17: the synchronous retrieval+generation+retry block
+    below is wrapped in try/except — same reasoning as ask_question(): an
+    unhandled exception during a live demo (rate limit, transient network
+    error, unexpected API response) should fail ONE answer gracefully,
+    never crash the whole app with a raw traceback on screen.
 
     Returns:
         (source_pages: list[int], generator yielding str chunks)
@@ -1815,34 +2222,27 @@ def ask_question_stream(
             yield "Please load a PDF first."
         return [], _no_pdf_gen()
 
-    chain_inputs, source_pages = _prepare_pipeline_inputs(
-        retriever, user_question, chat_history, document_type
-    )
-
-    raw_output = "".join(chain.stream(chain_inputs))
-    parsed = _parse_json_answer(raw_output)
-
-    # [FIX] Round 7.11: retry-on-not-found (see _looks_like_not_found /
-    # _prepare_escalated_retry_inputs) runs HERE — synchronously, before
-    # returning — rather than lazily inside the generator. This is what
-    # makes it safe: source_pages below is decided only once, after we
-    # already know which pass's answer will actually be shown, instead of
-    # being locked in to the first pass's pages before a later retry could
-    # change them. The user-visible latency characteristic is unchanged
-    # from before this fix — the generator already buffered the entire
-    # first pass before revealing anything, so doing the retry check at
-    # this point (rather than after returning) costs nothing extra except
-    # the bounded, rare cost of the retry call itself.
-    if _looks_like_not_found(parsed):
-        retry_inputs, retry_pages = _prepare_escalated_retry_inputs(
-            retriever, user_question, document_type
+    try:
+        chain_inputs, source_pages = _prepare_pipeline_inputs(
+            retriever, user_question, chat_history, document_type
         )
-        retry_raw = "".join(chain.stream(retry_inputs))
-        retry_parsed = _parse_json_answer(retry_raw)
-        if not _looks_like_not_found(retry_parsed):
-            parsed, source_pages = retry_parsed, retry_pages
 
-    final_text = _render_final_answer(parsed)
+        def _stream_invoke(inputs):
+            return "".join(chain.stream(inputs))
+
+        parsed, source_pages = _generate_with_self_correction(
+            _stream_invoke, chain_inputs, source_pages, retriever, user_question, document_type
+        )
+
+        final_text = _render_final_answer(parsed)
+    except Exception:
+        logger.debug("ask_question_stream failed unexpectedly", exc_info=True)
+        source_pages = []
+        final_text = (
+            "Something went wrong while generating this answer (a temporary "
+            "API or network issue). Please try asking again — if it keeps "
+            "happening, try rephrasing the question."
+        )
 
     def _answer_generator():
         # Reveal the already-final, validated text in small increments —
@@ -1873,7 +2273,8 @@ if __name__ == "__main__":
 
     print("=" * 55)
     print(" PDF Chatbot ready! (v7 — Structured JSON + Recall Fallback)")
-    print(f"   Model         : {MODEL}")
+    print(f"   Answer model  : {ANSWER_MODEL}")
+    print(f"   Rewrite model : {REWRITE_MODEL}")
     print(f"   Document type : {doc_type}")
     print(f"   Max tokens    : {MAX_TOKENS}")
     print(f"   Context budget: {CONTEXT_TOKEN_BUDGET:,} tokens")

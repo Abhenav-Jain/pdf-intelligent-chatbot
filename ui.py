@@ -9,10 +9,7 @@ UI responsibilities:
   - Markdown-rendered assistant responses (table / comparison / paragraph
     aware — logic_file.py detects the requested format and the model
     structures its answer accordingly)
-  - LIVE streaming of partial answers as they're generated, instead of
-    waiting for the full response (source pages appear as soon as
-    retrieval finishes, answer text fills in incrementally)
-  - Source page citation display
+  - LIVE reveal of the answer once it's ready, with source page citations
   - Truncation warning display (large PDFs)
 
 All retrieval / LLM logic lives in logic_file.py
@@ -22,6 +19,22 @@ small, self-contained renderer built only on the standard library. It
 covers exactly the formatting logic_file.py's system prompt instructs the
 model to produce: headings, bold/italic, bullet/numbered lists, fenced
 code blocks, tables, blockquotes, horizontal rules, and links.
+
+[FIX] Round 7.18: updated to match the latest logic_file.py —
+  - Model names are now imported (ANSWER_MODEL / REWRITE_MODEL) instead of
+    a hardcoded string in the sidebar, so this display can never silently
+    go stale again the way "mistral-small-2506" did after the model
+    upgrade to mistral-large-latest.
+  - The status-message flow around ask_question_stream() was updated:
+    that function now runs retrieval, generation, AND any self-correction
+    retries (truncation / numbering / not-found) synchronously before
+    returning anything — by the time the call returns, the full answer is
+    already finalized. The previous two-stage "Retrieving..." then
+    "Generating answer..." status no longer reflects reality (the second
+    stage would show for an instant after all the real work already
+    happened); a single status now covers the whole blocking call, and
+    the loop after it is purely a fast "typing" reveal of already-known
+    text, not live generation.
 """
 
 import html as html_lib
@@ -29,7 +42,13 @@ import re
 
 import streamlit as st
 
-from logic_file import load_pdf_from_bytes, build_chain, ask_question_stream
+from logic_file import (
+    load_pdf_from_bytes,
+    build_chain,
+    ask_question_stream,
+    ANSWER_MODEL,
+    REWRITE_MODEL,
+)
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -46,7 +65,6 @@ def _inline_md(text: str) -> str:
     """Apply inline markdown formatting: bold, italic, inline code, links."""
     text = html_lib.escape(text, quote=False)
 
-    # Protect inline code spans from further inline transforms
     code_spans = []
 
     def _stash_code(m):
@@ -70,6 +88,27 @@ def _inline_md(text: str) -> str:
     return text
 
 
+def _split_squished_table_rows(text: str) -> str:
+    """
+    [FIX] Round 7.21: defensive normalization for a real, observed bug —
+    the model occasionally writes several Markdown table rows back-to-back
+    with no newline between them (only a bare "| |" marking where a line
+    break should have been, e.g. "...(Page 19) | | 3-4 | 5 | Plus Display
+    | ..."). render_markdown() below parses strictly line-by-line, so
+    several rows squished onto one line never match the table-detection
+    pattern at all and fall through to being shown as literal pipe
+    characters in plain text instead of an actual table.
+
+    This inserts a newline at every "|" immediately followed by another
+    "|" with only whitespace in between — the row-boundary signature.
+    Accepted tradeoff: a genuinely empty table cell ("| ... | |") would
+    also get split this way, but that's rare for this app's content
+    (manual spec/error tables, where every cell is normally filled),
+    while failing to render a whole table is a much more visible problem.
+    """
+    return re.sub(r"\|[ \t]*\|", "|\n|", text)
+
+
 def render_markdown(text: str) -> str:
     """
     Convert assistant markdown output into HTML for display inside the
@@ -77,12 +116,12 @@ def render_markdown(text: str) -> str:
     `inline code`, fenced ```code blocks```, - / * bullet lists, 1. numbered
     lists, > blockquotes, --- horizontal rules, | table | rows, and links.
 
-    Called repeatedly with the growing accumulated text while a response is
-    streaming in, and once more with the final text — so it must tolerate
-    being run on a string that is still mid-stream (e.g. an unclosed code
-    fence or partial table row). Worst case is a brief visual flicker while
-    that block finishes arriving; nothing breaks or leaks unescaped HTML.
+    Called with the final, already-complete answer text (see the Round
+    7.18 note above — generation finishes before this is ever called now),
+    and also used during the brief incremental "reveal" loop, so it still
+    tolerates being run on a partial string without breaking.
     """
+    text = _split_squished_table_rows(text)
     lines = text.replace("\r\n", "\n").split("\n")
     html_out = []
     i, n = 0, len(lines)
@@ -98,7 +137,6 @@ def render_markdown(text: str) -> str:
     while i < n:
         stripped = lines[i].strip()
 
-        # Fenced code block
         if stripped.startswith("```"):
             flush_paragraph()
             lang = stripped[3:].strip()
@@ -107,20 +145,18 @@ def render_markdown(text: str) -> str:
             while i < n and not lines[i].strip().startswith("```"):
                 code_lines.append(lines[i])
                 i += 1
-            i += 1  # skip closing fence (or end of text if still streaming)
+            i += 1
             code_text = html_lib.escape("\n".join(code_lines))
             lang_class = f' class="language-{lang}"' if lang else ""
             html_out.append(f"<pre><code{lang_class}>{code_text}</code></pre>")
             continue
 
-        # Horizontal rule
         if re.fullmatch(r"-{3,}|\*{3,}|_{3,}", stripped):
             flush_paragraph()
             html_out.append("<hr>")
             i += 1
             continue
 
-        # Heading
         heading_match = re.match(r"^(#{1,6})\s+(.*)", stripped)
         if heading_match:
             flush_paragraph()
@@ -130,7 +166,6 @@ def render_markdown(text: str) -> str:
             i += 1
             continue
 
-        # Blockquote
         if stripped.startswith(">"):
             flush_paragraph()
             quote_lines = []
@@ -140,7 +175,6 @@ def render_markdown(text: str) -> str:
             html_out.append(f"<blockquote><p>{_inline_md(' '.join(quote_lines))}</p></blockquote>")
             continue
 
-        # Table (header row + |---|---| separator row)
         if (
             "|" in stripped
             and i + 1 < n
@@ -161,7 +195,6 @@ def render_markdown(text: str) -> str:
             html_out.append(f"<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>")
             continue
 
-        # Unordered list
         if re.match(r"^[-*+]\s+(.*)", stripped):
             flush_paragraph()
             items = []
@@ -174,7 +207,6 @@ def render_markdown(text: str) -> str:
             html_out.append("<ul>" + "".join(f"<li>{_inline_md(it)}</li>" for it in items) + "</ul>")
             continue
 
-        # Ordered list
         if re.match(r"^\d+\.\s+(.*)", stripped):
             flush_paragraph()
             items = []
@@ -187,13 +219,11 @@ def render_markdown(text: str) -> str:
             html_out.append("<ol>" + "".join(f"<li>{_inline_md(it)}</li>" for it in items) + "</ol>")
             continue
 
-        # Blank line → paragraph break
         if stripped == "":
             flush_paragraph()
             i += 1
             continue
 
-        # Default: accumulate into paragraph
         paragraph_buffer.append(stripped)
         i += 1
 
@@ -413,13 +443,13 @@ st.markdown("""
 
 # ── Session State Init ────────────────────────────────────────────────────────
 for key, default in [
-    ("chat_history", []),        # list of {role, content, pages?}
-    ("retriever", None),         # hybrid retriever
+    ("chat_history", []),
+    ("retriever", None),
     ("pdf_name", ""),
     ("pdf_pages", 0),
     ("pdf_chars", 0),
     ("chain", None),
-    ("pdf_processed", ""),       # guard against re-processing on rerun
+    ("pdf_processed", ""),
     ("truncation_warning", None),
     ("document_type", "technical"),
 ]:
@@ -495,11 +525,15 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown('<div class="section-label">System</div>', unsafe_allow_html=True)
-    st.markdown("**Model:** `mistral-small-2506`")
+    # [FIX] Round 7.18: imported from logic_file.py instead of hardcoded,
+    # so this can't silently drift out of sync with the actual model in
+    # use the way the old hardcoded "mistral-small-2506" string did.
+    st.markdown(f"**Answer model:** `{ANSWER_MODEL}`")
+    st.markdown(f"**Query rewriting:** `{REWRITE_MODEL}`")
     st.markdown("**Search:** Hybrid (BM25 + FAISS)")
     st.markdown("**Memory:** Last 3 exchanges")
+    st.markdown("**Self-correction:** Truncation, list numbering, retrieval retry")
     st.markdown("**Framework:** LangChain + PyMuPDF")
-    st.markdown("**Response:** Streamed live")
 
 
 # ── MAIN AREA ─────────────────────────────────────────────────────────────────
@@ -511,8 +545,6 @@ st.markdown(
 )
 st.markdown("---")
 
-# Chat history display (completed exchanges only — the in-progress exchange,
-# if any, is rendered live further down before being committed here)
 if st.session_state.chat_history:
     st.markdown('<div class="chat-container">', unsafe_allow_html=True)
     for msg in st.session_state.chat_history:
@@ -546,9 +578,6 @@ user_q = st.chat_input(
 if user_q and user_q.strip():
     st.session_state.chat_history.append({"role": "user", "content": user_q})
 
-    # Render the new exchange live, in place, as it streams in — this is
-    # the "partial results" turn: it is not yet in chat_history's rendered
-    # loop above, so we draw it manually here and commit it once finished.
     st.markdown('<div class="chat-label label-user">You</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div class="chat-user">{render_user_text(user_q)}</div>',
@@ -560,9 +589,16 @@ if user_q and user_q.strip():
     answer_placeholder = st.empty()
     sources_placeholder = st.empty()
 
+    # [FIX] Round 7.18: ask_question_stream() now runs retrieval,
+    # generation, AND any self-correction retries synchronously before
+    # returning — there's no longer a real "retrieval done, now
+    # generating" midpoint to show a second status for, since both are
+    # finished by the time the call below returns. A single status covers
+    # the whole blocking call; everything after it (sources, the reveal
+    # loop) happens against already-finalized results.
     status_placeholder.markdown(
         '<span class="status-badge status-live"><span class="status-dot"></span>'
-        'Retrieving relevant content...</span>',
+        'Thinking...</span>',
         unsafe_allow_html=True,
     )
 
@@ -577,25 +613,24 @@ if user_q and user_q.strip():
             document_type=st.session_state.document_type,
         )
 
-        # Source pages are known as soon as retrieval finishes — show them
-        # immediately rather than waiting for the full answer to generate.
-        status_placeholder.markdown(
-            '<span class="status-badge status-live"><span class="status-dot"></span>'
-            'Generating answer...</span>',
-            unsafe_allow_html=True,
-        )
+        status_placeholder.empty()
         sh = sources_html(source_pages)
         if sh:
             sources_placeholder.markdown(sh, unsafe_allow_html=True)
 
+        # The answer is already fully known at this point — this loop is a
+        # pacing/animation reveal over validated, final text, not live
+        # generation (see logic_file.py's ask_question_stream docstring).
         for chunk in stream_gen:
             accumulated += chunk
             answer_placeholder.markdown(bot_bubble_html(accumulated), unsafe_allow_html=True)
 
-        status_placeholder.empty()
-
     except Exception as e:
-        accumulated = f"Error: {e}"
+        # logic_file.py already catches its own internal failures and
+        # returns a graceful message — this is a backstop for anything
+        # unexpected at the UI layer itself, so a single bad turn still
+        # can't take down the whole app.
+        accumulated = f"Something went wrong displaying this answer: {e}"
         answer_placeholder.markdown(bot_bubble_html(accumulated), unsafe_allow_html=True)
         status_placeholder.empty()
 
